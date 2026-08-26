@@ -1,7 +1,11 @@
 mod app;
 
-fn main() -> eframe::Result<()> {
-    // Route panics to stderr with a clear marker instead of a GUI-less abort.
+use gpui::{
+    AnyView, AppContext as _, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
+    px, size,
+};
+
+fn main() {
     std::panic::set_hook(Box::new(|info| {
         eprintln!("[ade panic] {info}");
     }));
@@ -9,17 +13,27 @@ fn main() -> eframe::Result<()> {
     let config = ade_core::AppConfig::load();
     let rt = ade_core::runtime::spawn(config);
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("ADE — Agent Development Environment")
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([980.0, 620.0]),
-        ..Default::default()
-    };
+    Application::new()
+        .with_assets(gpui_component_assets::Assets)
+        .run(move |cx| {
+            gpui_component::init(cx);
 
-    eframe::run_native(
-        "ade",
-        options,
-        Box::new(move |cc| Ok(Box::new(app::AdeApp::new(cc, rt)))),
-    )
+            let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("ADE — Agent Development Environment".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            cx.open_window(options, |window, cx| {
+                let content = cx.new(|_| app::AdeApp::new(rt.clone()));
+                cx.new(|cx| gpui_component::Root::new(AnyView::from(content), window, cx))
+            })
+            .expect("open ADE window");
+
+            cx.activate(true);
+        });
 }

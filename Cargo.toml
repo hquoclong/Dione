@@ -21,6 +21,6 @@ dirs = "6"
 portpicker = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
-eframe = "0.36"
-egui = "0.36"
-egui_commonmark = "0.25"
+gpui = "=0.2.2"
+gpui-component = "=0.5.1"
+gpui-component-assets = "=0.5.1"
