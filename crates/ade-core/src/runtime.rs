@@ -201,11 +201,10 @@ async fn main_loop(
             _ = tokio::time::sleep(delay) => {
                 poll_count += 1;
                 // Periodic safety net independent of SSE health.
-                if busy {
-                    if let Some(sid) = st.store.active_session.clone() {
+                if busy
+                    && let Some(sid) = st.store.active_session.clone() {
                         reconcile_messages(&mut st, &client, &sid).await;
                     }
-                }
                 if poll_count.is_multiple_of(10) {
                     reconcile_sessions(&mut st, &client).await;
                 }
@@ -299,10 +298,10 @@ async fn handle_command(st: &mut LoopState, client: &OpencodeClient, cmd: Comman
             prompt(st, client, text).await;
         }
         Command::Abort => {
-            if let Some(sid) = st.store.active_session.clone() {
-                if let Err(e) = client.abort(&sid).await {
-                    st.store.push_error(format!("abort failed: {e}"));
-                }
+            if let Some(sid) = st.store.active_session.clone()
+                && let Err(e) = client.abort(&sid).await
+            {
+                st.store.push_error(format!("abort failed: {e}"));
             }
         }
         Command::PermissionReply {
@@ -343,11 +342,14 @@ async fn prompt(st: &mut LoopState, client: &OpencodeClient, text: String) {
         }),
         ..Default::default()
     };
-    if let Err(e) = client.prompt_async(&sid, &params).await {
-        st.store.push_error(format!("prompt failed: {e}"));
-    } else {
-        // Optimistically mark busy; authoritative status arrives via SSE/poll.
-        st.store.statuses.insert(sid.clone(), SessionStatus::Busy);
+    match client.prompt_async(&sid, &params).await {
+        Err(e) => {
+            st.store.push_error(format!("prompt failed: {e}"));
+        }
+        _ => {
+            // Optimistically mark busy; authoritative status arrives via SSE/poll.
+            st.store.statuses.insert(sid.clone(), SessionStatus::Busy);
+        }
     }
 }
 

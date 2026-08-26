@@ -1,6 +1,6 @@
 //! Context-window compiler tests.
 
-use ade_core::context::{compile, SectionKind};
+use ade_core::context::{SectionKind, compile};
 use ade_core::state::Store;
 use opencode_codes::protocol_generated::types::Event;
 
@@ -85,9 +85,11 @@ fn sections_follow_wire_order_with_usage_anchor() {
     assert_eq!(labels[0], "system prompt");
     assert!(labels.iter().any(|l| l.starts_with("user ·")));
     assert!(labels.contains(&"reasoning"));
-    assert!(labels
-        .iter()
-        .any(|l| l.starts_with("tool:read [completed]")));
+    assert!(
+        labels
+            .iter()
+            .any(|l| l.starts_with("tool:read [completed]"))
+    );
     assert!(labels.iter().any(|l| l.starts_with("assistant text")));
 
     // Usage anchors come from the newest assistant message.

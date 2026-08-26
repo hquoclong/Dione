@@ -1,7 +1,7 @@
 //! "Context window" panel: what the model sees, in order, with token estimates.
 
-use ade_core::context::{compile, SectionKind};
 use ade_core::Store;
+use ade_core::context::{SectionKind, compile};
 
 pub fn context_panel(ui: &mut egui::Ui, store: &Store) {
     let view = compile(store);

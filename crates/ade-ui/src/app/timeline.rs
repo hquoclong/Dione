@@ -1,6 +1,6 @@
 //! Live conversation timeline for the active session.
 
-use ade_core::state::{part_id, MessageEntry};
+use ade_core::state::{MessageEntry, part_id};
 use opencode_codes::protocol_generated::types::SessionStatus;
 use opencode_codes::protocol_generated::types::{Message, Part, ToolState};
 

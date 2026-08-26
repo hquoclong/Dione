@@ -248,10 +248,10 @@ impl Store {
             }
             MessagePartRemoved(e) => {
                 let d = &e.properties;
-                if let Some(list) = self.messages.get_mut(d.session_id.as_str()) {
-                    if let Some(m) = list.iter_mut().find(|m| m.id() == d.message_id) {
-                        m.parts.retain(|p| part_id(p) != d.part_id);
-                    }
+                if let Some(list) = self.messages.get_mut(d.session_id.as_str())
+                    && let Some(m) = list.iter_mut().find(|m| m.id() == d.message_id)
+                {
+                    m.parts.retain(|p| part_id(p) != d.part_id);
                 }
                 false
             }

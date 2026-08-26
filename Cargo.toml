@@ -1,10 +1,11 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/ade-core", "crates/ade-ui"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.90"
 license = "MIT"
 
 [workspace.dependencies]

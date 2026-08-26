@@ -40,10 +40,10 @@ fn inspector_panel(ui: &mut egui::Ui, selected: &mut Option<Part>) {
     ui.horizontal(|ui| {
         ui.heading("Raw part");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("copy").clicked() {
-                if let Ok(json) = serde_json::to_string_pretty(&part) {
-                    ui.ctx().copy_text(json);
-                }
+            if ui.button("copy").clicked()
+                && let Ok(json) = serde_json::to_string_pretty(&part)
+            {
+                ui.ctx().copy_text(json);
             }
             if ui.button("×").on_hover_text("Clear selection").clicked() {
                 *selected = None;
