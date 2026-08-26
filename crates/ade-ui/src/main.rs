@@ -29,7 +29,7 @@ fn main() {
             };
 
             cx.open_window(options, |window, cx| {
-                let content = cx.new(|_| app::AdeApp::new(rt.clone()));
+                let content = cx.new(|cx| app::AdeApp::new(rt.clone(), window, cx));
                 cx.new(|cx| gpui_component::Root::new(AnyView::from(content), window, cx))
             })
             .expect("open ADE window");

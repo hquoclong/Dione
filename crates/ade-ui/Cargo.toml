@@ -9,6 +9,7 @@ license.workspace = true
 ade-core = { path = "../ade-core" }
 opencode-codes = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
