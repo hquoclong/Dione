@@ -1,18 +1,95 @@
-//! Minimal M0 store: worktrees + errors only.
-//! Sessions/messages/diffs arrive in M1; fleet dashboard reads this in M2.
+//! M1 store: worktrees (M0) + sessions/messages/permissions/diffs.
+//! Fleet dashboard (M2) reads `worktrees` + `statuses` from here.
 
 use std::collections::{BTreeMap, VecDeque};
 
+use opencode_codes::protocol_generated::types::{
+    Event, Message, MessageWithParts, Part, Session, SessionStatus, Todo,
+};
+
 use crate::worktree::WorktreeRecord;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnState {
+    #[default]
+    Connecting,
+    Connected,
+    Disconnected,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageEntry {
+    pub info: Message,
+    pub parts: Vec<Part>,
+}
+
+impl From<MessageWithParts> for MessageEntry {
+    fn from(m: MessageWithParts) -> Self {
+        Self {
+            info: m.info,
+            parts: m.parts,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PendingPermission {
+    pub permission_id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub patterns: Vec<String>,
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderInfo {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub models: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SelectedModel {
+    pub provider_id: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Totals {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cost: f64,
+}
+
+impl Totals {
+    pub fn total_context(&self) -> f64 {
+        self.input + self.cache_read
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Store {
+    // M0: worktrees + errors.
     pub worktrees: BTreeMap<String, WorktreeRecord>,
     pub active_worktree: Option<String>,
     pub errors: VecDeque<String>,
+    // M1: agent mirror.
+    pub conn: ConnState,
+    pub sessions: BTreeMap<String, Session>,
+    pub statuses: BTreeMap<String, SessionStatus>,
+    pub messages: BTreeMap<String, Vec<MessageEntry>>,
+    pub diffs: BTreeMap<String, serde_json::Value>,
+    pub todos: BTreeMap<String, Vec<Todo>>,
+    pub pending_permissions: BTreeMap<String, PendingPermission>,
+    pub providers: Vec<ProviderInfo>,
+    pub selected_model: Option<SelectedModel>,
+    pub totals: Totals,
+    pub active_session: Option<String>,
 }
 
 impl Store {
+    // -- M0: worktrees ------------------------------------------------------
     pub fn upsert_worktree(&mut self, record: WorktreeRecord) {
         if self.active_worktree.is_none() {
             self.active_worktree = Some(record.slug.clone());
@@ -42,6 +119,158 @@ impl Store {
         while self.errors.len() > 20 {
             self.errors.pop_front();
         }
+    }
+
+    // -- M1: sessions -------------------------------------------------------
+    pub fn active_messages(&self) -> Option<&Vec<MessageEntry>> {
+        self.active_session
+            .as_ref()
+            .and_then(|id| self.messages.get(id))
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.active_session
+            .as_ref()
+            .and_then(|id| self.statuses.get(id))
+            .is_some_and(|s| matches!(s, SessionStatus::Busy | SessionStatus::Retry { .. }))
+    }
+
+    pub fn set_messages(&mut self, sid: &str, entries: Vec<MessageEntry>) {
+        self.messages.insert(sid.to_string(), entries);
+        self.recompute_totals();
+    }
+
+    fn recompute_totals(&mut self) {
+        let mut t = Totals::default();
+        for entries in self.messages.values() {
+            for e in entries {
+                if let Message::Assistant(a) = &e.info {
+                    t.input += a.tokens.input;
+                    t.cache_read += a.tokens.cache.read;
+                    t.output += a.tokens.output;
+                    t.cost += a.cost;
+                }
+            }
+        }
+        self.totals = t;
+    }
+
+    /// Apply one SSE event to the mirror. Best-effort: unknown or
+    /// partial frames are ignored — REST reconcile is authoritative.
+    pub fn apply_event(&mut self, ev: &Event) {
+        match ev {
+            Event::SessionCreated(e) => {
+                let s = e.properties.info.clone();
+                if self.active_session.is_none() {
+                    self.active_session = Some(s.id.clone());
+                }
+                self.sessions.insert(s.id.clone(), s);
+            }
+            Event::SessionUpdated(e) => {
+                let s = e.properties.info.clone();
+                self.sessions.insert(s.id.clone(), s);
+            }
+            Event::SessionDeleted(e) => {
+                let id = &e.properties.session_id;
+                self.sessions.remove(id);
+                self.statuses.remove(id);
+                self.messages.remove(id);
+                if self.active_session.as_deref() == Some(id) {
+                    self.active_session = self.sessions.keys().next().cloned();
+                }
+            }
+            Event::SessionStatus(e) => {
+                self.statuses
+                    .insert(e.properties.session_id.clone(), e.properties.status.clone());
+            }
+            Event::SessionIdle(e) => {
+                self.statuses
+                    .insert(e.properties.session_id.clone(), SessionStatus::Idle);
+            }
+            Event::MessageUpdated(e) => {
+                let sid = e.properties.session_id.clone();
+                let entries = self.messages.entry(sid).or_default();
+                let id = message_id(&e.properties.info);
+                match entries.iter_mut().find(|x| message_id(&x.info) == id) {
+                    Some(x) => x.info = e.properties.info.clone(),
+                    None => entries.push(MessageEntry {
+                        info: e.properties.info.clone(),
+                        parts: Vec::new(),
+                    }),
+                }
+                self.recompute_totals();
+            }
+            Event::MessagePartUpdated(e) => {
+                let sid = e.properties.session_id.clone();
+                let entries = self.messages.entry(sid).or_default();
+                if let Some((msg_id, part_id)) = part_key(&e.properties.part) {
+                    if let Some(entry) = entries.iter_mut().find(|x| message_id(&x.info) == msg_id)
+                    {
+                        match entry.parts.iter_mut().find(|p| part_id_of(p) == Some(part_id.as_str()))
+                        {
+                            Some(p) => *p = e.properties.part.clone(),
+                            None => entry.parts.push(e.properties.part.clone()),
+                        }
+                    }
+                }
+            }
+            Event::PermissionAsked(e) => {
+                let p = &e.properties;
+                self.pending_permissions.insert(
+                    p.id.clone(),
+                    PendingPermission {
+                        permission_id: p.id.clone(),
+                        session_id: p.session_id.clone(),
+                        kind: p.permission.clone(),
+                        patterns: p.patterns.clone(),
+                        metadata: p.metadata.clone(),
+                    },
+                );
+            }
+            Event::PermissionReplied(e) => {
+                self.pending_permissions.remove(&e.properties.request_id);
+            }
+            Event::TodoUpdated(e) => {
+                self.todos
+                    .insert(e.properties.session_id.clone(), e.properties.todos.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn message_id(m: &Message) -> &str {
+    match m {
+        Message::User(u) => &u.id,
+        Message::Assistant(a) => &a.id,
+    }
+}
+
+/// `(message_id, part_id)` for part variants that carry both.
+fn part_key(p: &Part) -> Option<(String, String)> {
+    let (msg, id) = match p {
+        Part::Text(t) => (t.message_id.clone(), t.id.clone()),
+        Part::Reasoning(r) => (r.message_id.clone(), r.id.clone()),
+        Part::File(f) => (f.message_id.clone(), f.id.clone()),
+        Part::Tool(t) => (t.message_id.clone(), t.id.clone()),
+        Part::StepStart(s) => (s.message_id.clone(), s.id.clone()),
+        Part::StepFinish(s) => (s.message_id.clone(), s.id.clone()),
+        Part::Patch(p) => (p.message_id.clone(), p.id.clone()),
+        _ => return None,
+    };
+    Some((msg, id))
+}
+
+fn part_id_of(p: &Part) -> Option<&str> {
+    match p {
+        Part::Text(t) => Some(&t.id),
+        Part::Reasoning(r) => Some(&r.id),
+        Part::File(f) => Some(&f.id),
+        Part::Tool(t) => Some(&t.id),
+        Part::StepStart(s) => Some(&s.id),
+        Part::StepFinish(s) => Some(&s.id),
+        Part::Patch(p) => Some(&p.id),
+        _ => None,
     }
 }
 
