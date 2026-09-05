@@ -10,8 +10,8 @@ use std::time::Duration;
 use opencode_codes::client_async::OpencodeClient;
 use opencode_codes::protocol_generated::types::{
     Event, PermissionReplyParams, PermissionReplyResponse, PromptAsyncParams,
-    PromptAsyncParamsPartsItem, Session, SessionCreateParams, SessionStatus,
-    SubtaskPartInputModel, TextPartInput, Todo,
+    PromptAsyncParamsPartsItem, Session, SessionCreateParams, SessionStatus, SubtaskPartInputModel,
+    TextPartInput, Todo,
 };
 use opencode_codes::sse::{RetryConfig, StreamEvent};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -22,8 +22,15 @@ use crate::state::{ConnState, MessageEntry, SelectedModel, Store};
 
 #[derive(Debug, Clone)]
 pub enum Command {
-    CreateSession { title: String },
-    Prompt { text: String },
+    CreateSession {
+        title: String,
+    },
+    SelectSession {
+        id: String,
+    },
+    Prompt {
+        text: String,
+    },
     Abort,
     FetchDiff(String),
     PermissionReply {
@@ -65,10 +72,7 @@ impl RuntimeHandle {
     }
 
     pub fn snapshot(&self) -> Arc<Store> {
-        self.slot
-            .read()
-            .map(|g| Arc::clone(&g))
-            .unwrap_or_default()
+        self.slot.read().map(|g| Arc::clone(&g)).unwrap_or_default()
     }
 }
 
@@ -223,11 +227,7 @@ async fn sse_pump(client: OpencodeClient, slot: Arc<RwLock<Arc<Store>>>) {
     publish(&slot, &st);
 }
 
-async fn apply_stream_event(
-    client: &OpencodeClient,
-    slot: &Arc<RwLock<Arc<Store>>>,
-    ev: Event,
-) {
+async fn apply_stream_event(client: &OpencodeClient, slot: &Arc<RwLock<Arc<Store>>>, ev: Event) {
     let mut st = LoopState::load(slot);
     // Permission + todo frames carry full data — no extra fetch needed.
     // Message frames only patch the mirror; the poll tick reconciles fully.
@@ -247,7 +247,7 @@ async fn poll_once(st: &mut LoopState, client: &OpencodeClient, tick: u64) {
         reconcile_messages(st, client, &sid).await;
         fetch_todos(st, client, &sid).await;
     }
-    if tick % 10 == 0 {
+    if tick.is_multiple_of(10) {
         fetch_providers(st, client).await;
     }
 }
@@ -277,12 +277,19 @@ async fn handle_command(st: &mut LoopState, client: &OpencodeClient, cmd: Comman
                 Err(e) => st.store.push_error(format!("create session failed: {e:#}")),
             }
         }
+        Command::SelectSession { id } => {
+            if st.store.sessions.contains_key(&id) {
+                st.store.active_session = Some(id.clone());
+                reconcile_messages(st, client, &id).await;
+                fetch_todos(st, client, &id).await;
+            }
+        }
         Command::Prompt { text } => prompt(st, client, text).await,
         Command::Abort => {
-            if let Some(sid) = st.store.active_session.clone() {
-                if let Err(e) = client.abort(&sid).await {
-                    st.store.push_error(format!("abort failed: {e:#}"));
-                }
+            if let Some(sid) = st.store.active_session.clone()
+                && let Err(e) = client.abort(&sid).await
+            {
+                st.store.push_error(format!("abort failed: {e:#}"));
             }
         }
         Command::PermissionReply {
@@ -323,10 +330,14 @@ async fn prompt(st: &mut LoopState, client: &OpencodeClient, text: String) {
         agent: None,
         format: None,
         message_id: None,
-        model: st.store.selected_model.as_ref().map(|m| SubtaskPartInputModel {
-            provider_id: m.provider_id.clone(),
-            model_id: m.id.clone(),
-        }),
+        model: st
+            .store
+            .selected_model
+            .as_ref()
+            .map(|m| SubtaskPartInputModel {
+                provider_id: m.provider_id.clone(),
+                model_id: m.id.clone(),
+            }),
         no_reply: None,
         parts: vec![PromptAsyncParamsPartsItem::Text(TextPartInput {
             id: None,
@@ -373,7 +384,9 @@ async fn reply_permission(
         Ok(_) => {
             st.store.pending_permissions.remove(&permission_id);
         }
-        Err(e) => st.store.push_error(format!("permission reply failed: {e:#}")),
+        Err(e) => st
+            .store
+            .push_error(format!("permission reply failed: {e:#}")),
     }
 }
 
@@ -474,6 +487,8 @@ async fn fetch_providers(st: &mut LoopState, client: &OpencodeClient) {
 
     match parsed {
         Ok(providers) => st.store.providers = providers,
-        Err(e) => st.store.push_error(format!("providers fetch failed: {e:#}")),
+        Err(e) => st
+            .store
+            .push_error(format!("providers fetch failed: {e:#}")),
     }
 }

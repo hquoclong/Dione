@@ -39,8 +39,10 @@ fn session_created_becomes_active() {
 
 #[test]
 fn status_busy_marks_busy() {
-    let mut s = Store::default();
-    s.active_session = Some("ses_1".into());
+    let mut s = Store {
+        active_session: Some("ses_1".into()),
+        ..Default::default()
+    };
     apply(
         &mut s,
         json!({
@@ -55,8 +57,10 @@ fn status_busy_marks_busy() {
 
 #[test]
 fn session_idle_clears_busy() {
-    let mut s = Store::default();
-    s.active_session = Some("ses_1".into());
+    let mut s = Store {
+        active_session: Some("ses_1".into()),
+        ..Default::default()
+    };
     s.statuses.insert("ses_1".into(), SessionStatus::Busy);
     apply(
         &mut s,

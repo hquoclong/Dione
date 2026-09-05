@@ -203,14 +203,16 @@ impl Store {
             Event::MessagePartUpdated(e) => {
                 let sid = e.properties.session_id.clone();
                 let entries = self.messages.entry(sid).or_default();
-                if let Some((msg_id, part_id)) = part_key(&e.properties.part) {
-                    if let Some(entry) = entries.iter_mut().find(|x| message_id(&x.info) == msg_id)
+                if let Some((msg_id, part_id)) = part_key(&e.properties.part)
+                    && let Some(entry) = entries.iter_mut().find(|x| message_id(&x.info) == msg_id)
+                {
+                    match entry
+                        .parts
+                        .iter_mut()
+                        .find(|p| part_id_of(p) == Some(part_id.as_str()))
                     {
-                        match entry.parts.iter_mut().find(|p| part_id_of(p) == Some(part_id.as_str()))
-                        {
-                            Some(p) => *p = e.properties.part.clone(),
-                            None => entry.parts.push(e.properties.part.clone()),
-                        }
+                        Some(p) => *p = e.properties.part.clone(),
+                        None => entry.parts.push(e.properties.part.clone()),
                     }
                 }
             }

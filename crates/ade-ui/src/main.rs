@@ -10,6 +10,9 @@ fn main() {
         eprintln!("[ade panic] {info}");
     }));
 
+    let config = ade_core::AppConfig::load();
+    let rt = ade_core::runtime::spawn(config);
+
     Application::new()
         .with_assets(gpui_component_assets::Assets)
         .run(move |cx| {
@@ -19,14 +22,14 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("ADE — Agentic IDE (M0)".into()),
+                    title: Some("ADE — Agentic IDE".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             };
 
             cx.open_window(options, |window, cx| {
-                let content = cx.new(|cx| app::AdeApp::new(window, cx));
+                let content = cx.new(|cx| app::AdeApp::new(rt.clone(), window, cx));
                 cx.new(|cx| gpui_component::Root::new(AnyView::from(content), window, cx))
             })
             .expect("open ADE window");
