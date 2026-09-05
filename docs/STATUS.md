@@ -2,25 +2,23 @@
 
 ## Current milestone
 
-M2 — Fleet multi-agent (slices 1+2 done, slice 3: fan-out/compare/merge).
+M2 — Fleet multi-agent DONE. Next: live Tier A check, then M3 scoping.
 
 ## Last commit
 
-- `90c8a09` feat(m2b): session-worktree link — per-directory clients+pumps,
-  fleet sidebar (`495e044` m2a git ops before it)
-- Verified: check pass, clippy 0 warnings, 22/22 tests pass (incl. 4 real
-  git worktree tests + 3 fleet mapping tests), Xvfb smoke clean.
+- `7d420e7` feat(m2e): merge winner --no-ff (`04c5dbb` m2d notes,
+  `dc209fb` m2c fan-out/compare before it)
+- Verified: check pass, clippy 0 warnings, 26/26 tests pass (incl. 6 real
+  git tests: create/remove/prune/merge/dirty-guard), Xvfb smoke clean.
 
 ## Next up
 
-1. M2 slice 3: fan-out 1 prompt → N worktrees, side-by-side diff compare,
-   annotate → send back, merge winner.
-2. Live Tier A check: run app against real `opencode serve`, create 2
-   worktrees, verify per-directory sessions + pumps (needs provider key
-   for Tier B prompts).
+1. Live Tier A check: run app against real `opencode serve`, create 2
+   worktrees via `+ wt`, fan-out a prompt, annotate a diff line, merge —
+   needs provider key for prompts (Tier B).
+2. M3 scoping: SSH remote worktrees vs packaging vs usage tracking.
 3. Optional: rename local `master` → `main`.
 
 ## Blockers
 
-- Live LLM test (Tier B) needs a provider key; Tier A (no LLM) untested
-  until `opencode serve` is exercised with `ADE_EXTERNAL_SERVER_URL`.
+- None for build; live LLM verification needs a provider key.
