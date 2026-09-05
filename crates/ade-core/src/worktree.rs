@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 pub const WORKTREE_DIR_NAME: &str = ".ade-worktrees";
 pub const BRANCH_PREFIX: &str = "ade/";
 pub const MAX_MANAGED_WORKTREES: usize = 15;
+/// Optional file in the repo root listing gitignored paths (one per line)
+/// to copy into fresh worktrees (cf. Hermes/Cline `.worktreeinclude`).
+pub const WORKTREE_INCLUDE_FILE: &str = ".worktreeinclude";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeStatus {
@@ -78,6 +81,228 @@ pub fn is_worktree_path(path: &Path) -> bool {
             .to_str()
             .is_some_and(|s| s == WORKTREE_DIR_NAME)
     })
+}
+
+// ------------------------------------------------------------ git ops
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorktreeError {
+    #[error("invalid worktree slug: {0:?}")]
+    InvalidSlug(String),
+    #[error("worktree limit reached ({MAX_MANAGED_WORKTREES})")]
+    LimitReached,
+    #[error("worktree already exists: {0}")]
+    AlreadyExists(String),
+    #[error("{0}")]
+    Git(String),
+    #[error("io error: {0}")]
+    Io(String),
+}
+
+/// One entry of `git worktree list --porcelain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    pub path: PathBuf,
+    /// `refs/heads/<name>` short name, if on a branch.
+    pub branch: Option<String>,
+    pub detached: bool,
+}
+
+/// Create a worktree at `<repo>/.ade-worktrees/<slug>` on branch
+/// `ade/<slug>`, then copy `.worktreeinclude` entries into it.
+pub async fn create(repo: &Path, raw_slug: &str) -> Result<WorktreeRecord, WorktreeError> {
+    let slug = normalize_slug(raw_slug);
+    if slug.is_empty() {
+        return Err(WorktreeError::InvalidSlug(raw_slug.to_string()));
+    }
+    if managed_count(repo).await? >= MAX_MANAGED_WORKTREES {
+        return Err(WorktreeError::LimitReached);
+    }
+    let path = worktree_path(repo, &slug);
+    if path.exists() {
+        return Err(WorktreeError::AlreadyExists(slug));
+    }
+    let branch = branch_name(&slug);
+    run_git(
+        repo,
+        &["worktree", "add", &path.to_string_lossy(), "-b", &branch],
+    )
+    .await?;
+    copy_worktreeinclude(repo, &path);
+    Ok(WorktreeRecord {
+        slug,
+        branch,
+        path,
+        status: WorktreeStatus::Creating,
+    })
+}
+
+/// Remove a worktree and force-delete its branch. Keeps going when parts
+/// are already gone (crashed sessions); errors only on real git failures.
+pub async fn remove(repo: &Path, slug: &str) -> Result<(), WorktreeError> {
+    let path = worktree_path(repo, slug);
+    if path.exists() || is_registered(repo, &path).await {
+        // `--force` handles dirty worktrees; a missing path is not fatal.
+        let _ = run_git(
+            repo,
+            &["worktree", "remove", "--force", &path.to_string_lossy()],
+        )
+        .await;
+    }
+    // Best effort: drop our branch if nothing checks it out anymore.
+    if !branch_checked_out(repo, slug).await? {
+        let _ = run_git(repo, &["branch", "-D", &branch_name(slug)]).await;
+    }
+    Ok(())
+}
+
+/// All worktrees registered in `repo` (main checkout first).
+pub async fn list(repo: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+    parse_porcelain(&run_git(repo, &["worktree", "list", "--porcelain"]).await?)
+}
+
+/// `git worktree prune` plus deletion of merged `ade/*` orphan branches
+/// whose worktree directory is gone.
+pub async fn prune(repo: &Path) -> Result<(), WorktreeError> {
+    run_git(repo, &["worktree", "prune"]).await?;
+    let infos = list(repo).await.unwrap_or_default();
+    let live_branches: Vec<&str> = infos.iter().filter_map(|i| i.branch.as_deref()).collect();
+    let merged = run_git(repo, &["branch", "--merged", "HEAD", "--list", "ade/*"]).await?;
+    for line in merged.lines() {
+        let b = line.trim().trim_start_matches("* ").trim();
+        if b.is_empty() || live_branches.contains(&b) {
+            continue;
+        }
+        let slug = b.strip_prefix(BRANCH_PREFIX).unwrap_or(b);
+        if !worktree_path(repo, slug).exists() {
+            let _ = run_git(repo, &["branch", "-d", b]).await;
+        }
+    }
+    Ok(())
+}
+
+async fn managed_count(repo: &Path) -> Result<usize, WorktreeError> {
+    Ok(list(repo)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|i| is_worktree_path(&i.path))
+        .count())
+}
+
+async fn is_registered(repo: &Path, path: &Path) -> bool {
+    list(repo)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|i| i.path == path)
+}
+
+async fn branch_checked_out(repo: &Path, slug: &str) -> Result<bool, WorktreeError> {
+    let want = format!("refs/heads/{}", branch_name(slug));
+    Ok(list(repo).await?.iter().any(|i| {
+        i.branch
+            .as_deref()
+            .is_some_and(|b| b == want || b == branch_name(slug))
+    }))
+}
+
+fn parse_porcelain(out: &str) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+    let mut infos = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    let mut detached = false;
+    let mut flush =
+        |path: &mut Option<PathBuf>, branch: &mut Option<String>, detached: &mut bool| {
+            if let Some(p) = path.take() {
+                infos.push(WorktreeInfo {
+                    path: p,
+                    branch: branch.take(),
+                    detached: *detached,
+                });
+            }
+            *detached = false;
+        };
+    for line in out.lines() {
+        if line.is_empty() {
+            flush(&mut path, &mut branch, &mut detached);
+        } else if let Some(p) = line.strip_prefix("worktree ") {
+            flush(&mut path, &mut branch, &mut detached);
+            path = Some(PathBuf::from(p));
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        } else if line == "detached" || line == "bare" {
+            detached = true;
+        }
+    }
+    flush(&mut path, &mut branch, &mut detached);
+    Ok(infos)
+}
+
+fn copy_worktreeinclude(repo: &Path, dest: &Path) {
+    let Ok(raw) = std::fs::read_to_string(repo.join(WORKTREE_INCLUDE_FILE)) else {
+        return;
+    };
+    for entry in raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        // Stay inside the repo: reject absolute paths and `..`.
+        let rel = Path::new(entry);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            continue;
+        }
+        let src = repo.join(rel);
+        let dst = dest.join(rel);
+        if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::copy(&src, &dst);
+        } else if src.is_dir() {
+            copy_dir_recursive(&src, &dst);
+        }
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    let _ = std::fs::create_dir_all(dst);
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let from = e.path();
+        let to = dst.join(e.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to);
+        } else if from.is_file() {
+            let _ = std::fs::copy(&from, &to);
+        }
+    }
+}
+
+async fn run_git(repo: &Path, args: &[&str]) -> Result<String, WorktreeError> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| WorktreeError::Io(e.to_string()))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(WorktreeError::Git(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
 }
 
 #[cfg(test)]
