@@ -1065,11 +1065,27 @@ impl AdeApp {
             } else {
                 format!("⑂ {scope}")
             };
-            let mut section = div().flex().flex_col().gap_1().child(
+            let mut head_row = div().flex().items_center().justify_between().child(
                 Label::new(header)
                     .text_size(px(12.))
                     .text_color(warn_color()),
             );
+            if !scope.is_empty() {
+                let merge_slug = scope.clone();
+                let merge = cx.listener(move |app, _: &ClickEvent, _, _| {
+                    app.rt.send(Command::MergeWorktree {
+                        slug: merge_slug.clone(),
+                    });
+                });
+                head_row = head_row.child(
+                    Button::new(SharedString::from(format!("merge-{scope}")))
+                        .label("Merge winner")
+                        .xsmall()
+                        .compact()
+                        .on_click(merge),
+                );
+            }
+            let mut section = div().flex().flex_col().gap_1().child(head_row);
             let mut sids: Vec<_> = self
                 .store
                 .diffs

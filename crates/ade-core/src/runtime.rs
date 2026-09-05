@@ -41,6 +41,9 @@ pub enum Command {
     RemoveWorktree {
         slug: String,
     },
+    MergeWorktree {
+        slug: String,
+    },
     SelectWorktree {
         slug: String,
     },
@@ -390,6 +393,7 @@ async fn handle_command(st: &mut LoopState, slot: &Arc<RwLock<Arc<Store>>>, cmd:
         }
         Command::CreateWorktree { slug } => create_worktree(st, slot, slug).await,
         Command::RemoveWorktree { slug } => remove_worktree(st, &slug).await,
+        Command::MergeWorktree { slug } => merge_worktree(st, &slug).await,
         Command::SelectWorktree { slug } => select_worktree(st, &slug).await,
         Command::SelectSession { id } => {
             if st.store.sessions.contains_key(&id) {
@@ -524,15 +528,32 @@ async fn create_worktree(st: &mut LoopState, slot: &Arc<RwLock<Arc<Store>>>, slu
     }
 }
 
-async fn remove_worktree(st: &mut LoopState, slug: &str) {
-    // Abort + retire every session scoped to this worktree.
-    let sids: Vec<String> = st
-        .store
+/// Forget a worktree's sessions/clients/records after its git dir is gone
+/// (removed or merged). Shared by remove and merge paths.
+fn drop_scope(st: &mut LoopState, slug: &str, sids: &[String]) {
+    for sid in sids {
+        st.store.retire_session(sid);
+    }
+    st.store.remove_worktree(slug);
+    st.clients.remove(slug);
+    st.pumped.remove(slug);
+    if st.store.active_worktree.as_deref() == Some(slug) {
+        st.store.active_worktree = st.store.worktrees.keys().next().cloned();
+    }
+}
+
+fn scoped_sessions(st: &LoopState, slug: &str) -> Vec<String> {
+    st.store
         .session_scope
         .iter()
         .filter(|(_, s)| *s == slug)
         .map(|(id, _)| id.clone())
-        .collect();
+        .collect()
+}
+
+async fn remove_worktree(st: &mut LoopState, slug: &str) {
+    // Abort + retire every session scoped to this worktree.
+    let sids = scoped_sessions(st, slug);
     for sid in &sids {
         if let Some(client) = st
             .clients
@@ -542,17 +563,25 @@ async fn remove_worktree(st: &mut LoopState, slug: &str) {
         {
             let _ = client.abort(sid).await;
         }
-        st.store.retire_session(sid);
     }
     if let Err(e) = worktree::remove(&st.repo, slug).await {
         st.store
             .push_error(format!("remove worktree failed: {e:#}"));
     }
-    st.store.remove_worktree(slug);
-    st.clients.remove(slug);
-    st.pumped.remove(slug);
-    if st.store.active_worktree.as_deref() == Some(slug) {
-        st.store.active_worktree = st.store.worktrees.keys().next().cloned();
+    drop_scope(st, slug, &sids);
+}
+
+async fn merge_worktree(st: &mut LoopState, slug: &str) {
+    let sids = scoped_sessions(st, slug);
+    match worktree::merge_winner(&st.repo, slug).await {
+        Ok(summary) => {
+            tracing::info!("merged {slug}: {summary}");
+            drop_scope(st, slug, &sids);
+            let _ = worktree::prune(&st.repo).await;
+        }
+        Err(e) => {
+            st.store.push_error(format!("merge {slug} failed: {e:#}"));
+        }
     }
 }
 

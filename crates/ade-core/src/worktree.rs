@@ -165,6 +165,30 @@ pub async fn list(repo: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError> {
     parse_porcelain(&run_git(repo, &["worktree", "list", "--porcelain"]).await?)
 }
 
+/// Merge `ade/<slug>` into the repo checkout with `--no-ff`, then remove
+/// the worktree. Fails cleanly on a dirty repo or conflicts so the user can
+/// resolve by hand; nothing is deleted in that case.
+pub async fn merge_winner(repo: &Path, slug: &str) -> Result<String, WorktreeError> {
+    let dirty = run_git(repo, &["status", "--porcelain"]).await?;
+    if !dirty.trim().is_empty() {
+        return Err(WorktreeError::Git(
+            "repo checkout has uncommitted changes — commit or stash first".into(),
+        ));
+    }
+    let branch = branch_name(slug);
+    let out = run_git(
+        repo,
+        &["merge", "--no-ff", &branch, "-m", &format!("merge: {slug}")],
+    )
+    .await
+    .map_err(|e| {
+        WorktreeError::Git(format!(
+            "merge conflict in {branch} — resolve in the repo, then remove the worktree by hand: {e}"
+        ))
+    })?;
+    remove(repo, slug).await?;
+    Ok(out.trim().to_string())
+}
 /// `git worktree prune` plus deletion of merged `ade/*` orphan branches
 /// whose worktree directory is gone.
 pub async fn prune(repo: &Path) -> Result<(), WorktreeError> {

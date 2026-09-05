@@ -20,13 +20,17 @@ One task = one isolated git worktree, N agents in parallel.
 - [x] 1 opencode session per worktree (session ↔ worktree link in Store,
       per-directory clients + SSE pumps) (`90c8a09`)
 - [x] Dashboard: `Needs you / Working / Done` in grouped Fleet sidebar
-- [ ] Fan-out: 1 prompt → N worktrees; compare diffs side-by-side
-- [ ] Annotate diff lines → send batch back to the right agent
-- [ ] Merge winner + prune; keep dirty worktrees for manual recovery
+- [x] Fan-out: 1 prompt → N worktrees (`⇉ all`); grouped multi-session
+      diff compare (`↻ all`)
+- [x] Annotate diff lines → send batch back to the right agent
+- [x] Merge winner (`--no-ff`) + prune; keep dirty worktrees for manual
+      recovery
 - [x] Cap ~15 managed worktrees (enforced in `worktree::create`)
 
 Conventions: path `<repo>/.ade-worktrees/<slug>`, branch `ade/<slug>`;
 one branch in one worktree; detached HEAD for experiments.
+Gitignore `.ade-worktrees/` in every target repo (else `git add .` warns
+about embedded repos).
 
 ## M3+ — Later (not scheduled)
 

@@ -115,3 +115,53 @@ async fn prune_drops_merged_orphan_branch() {
     );
     cleanup(&repo);
 }
+
+#[tokio::test]
+async fn merge_winner_brings_files_and_cleans_up() {
+    let repo = init_repo();
+    let r = worktree::create(&repo, "feat-win").await.unwrap();
+    std::fs::write(r.path.join("win.txt"), "winner\n").unwrap();
+    sh(&r.path, &["add", "."]);
+    sh(&r.path, &["commit", "-qm", "win"]);
+    // Diverge main so the merge is a real --no-ff merge commit.
+    std::fs::write(repo.join("main.txt"), "main\n").unwrap();
+    sh(&repo, &["add", "."]);
+    sh(&repo, &["commit", "-qm", "main work"]);
+
+    let summary = worktree::merge_winner(&repo, "feat-win").await.unwrap();
+    assert!(
+        summary.contains("Merge"),
+        "unexpected merge output: {summary}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("win.txt")).unwrap(),
+        "winner\n"
+    );
+    assert!(!r.path.exists());
+    let branches = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["branch", "--list", "ade/*"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&branches.stdout).contains("ade/feat-win"),
+        "branch should be gone after merge"
+    );
+    cleanup(&repo);
+}
+
+#[tokio::test]
+async fn merge_winner_refuses_dirty_repo() {
+    let repo = init_repo();
+    let r = worktree::create(&repo, "feat-dirty").await.unwrap();
+    std::fs::write(repo.join("uncommitted.txt"), "x\n").unwrap();
+    let err = worktree::merge_winner(&repo, "feat-dirty")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, worktree::WorktreeError::Git(_)));
+    // Nothing deleted on failure.
+    assert!(r.path.exists());
+    worktree::remove(&repo, "feat-dirty").await.unwrap();
+    cleanup(&repo);
+}
