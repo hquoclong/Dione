@@ -326,3 +326,30 @@ fn format_review_notes_renders_items() {
     assert!(body.contains("a.rs:12 — rename this"));
     assert!(body.contains("b.rs:3 — add test"));
 }
+
+#[test]
+fn parse_patch_lines_multi_hunk() {
+    use ade_core::state::parse_patch_lines;
+
+    let patch = "--- a/f.rs\n+++ b/f.rs\n@@ -1,3 +1,4 @@\n ctx\n-old\n+new1\n+new2\n ctx2\n@@ -10,2 +11,2 @@\n-old2\n+new3\n";
+    let lines = parse_patch_lines(patch);
+    let numbered: Vec<(Option<u32>, &str)> =
+        lines.iter().map(|l| (l.line, l.text.as_str())).collect();
+    assert!(
+        numbered
+            .iter()
+            .any(|(n, t)| n.is_none() && t.starts_with("@@"))
+    );
+    // First hunk: ctx=1, -old=old-file 2, +new1=2, +new2=3, ctx2=4.
+    let texts: Vec<&str> = numbered.iter().map(|(_, t)| *t).collect();
+    let at = |t: &str| numbered.iter().find(|(_, x)| *x == t).unwrap().0;
+    assert_eq!(at(" ctx"), Some(1));
+    assert_eq!(at("-old"), Some(2));
+    assert_eq!(at("+new1"), Some(2));
+    assert_eq!(at("+new2"), Some(3));
+    assert_eq!(at(" ctx2"), Some(4));
+    // Second hunk restarts counters: -old2=old 10, +new3=new 11.
+    assert_eq!(at("-old2"), Some(10));
+    assert_eq!(at("+new3"), Some(11));
+    assert!(texts.contains(&"--- a/f.rs"));
+}

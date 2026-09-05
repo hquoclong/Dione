@@ -8,7 +8,7 @@ pub mod worktree;
 pub use config::AppConfig;
 pub use runtime::{Command, PermissionResponse, RuntimeHandle};
 pub use state::{
-    ConnState, MessageEntry, PendingPermission, ProviderInfo, SelectedModel, Store, Totals,
-    event_session_id,
+    ConnState, DiffNote, MessageEntry, PatchLine, PendingPermission, ProviderInfo, SelectedModel,
+    Store, Totals, event_session_id, format_review_notes, parse_patch_lines,
 };
 pub use worktree::WorktreeStatus;

@@ -71,6 +71,69 @@ pub fn format_review_notes(notes: &[DiffNote]) -> String {
     out
 }
 
+/// One rendered diff line with its new/old-file number, if countable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchLine {
+    /// 1-based line number (`+`/` ` lines: new file; `-` lines: old file).
+    pub line: Option<u32>,
+    pub text: String,
+}
+
+/// Map unified-diff lines to file line numbers. Handles multi-hunk patches;
+/// `+++`/`---`/headers/no-newline markers get `None`.
+pub fn parse_patch_lines(patch: &str) -> Vec<PatchLine> {
+    let mut out = Vec::new();
+    let mut old: u32 = 0;
+    let mut new: u32 = 0;
+    let mut in_hunk = false;
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            for part in line.split_whitespace() {
+                if let Some(v) = part.strip_prefix('-') {
+                    old = v.split(',').next().unwrap_or("0").parse().unwrap_or(0);
+                } else if let Some(v) = part.strip_prefix('+') {
+                    new = v.split(',').next().unwrap_or("0").parse().unwrap_or(0);
+                }
+            }
+            in_hunk = true;
+            out.push(PatchLine {
+                line: None,
+                text: line.to_string(),
+            });
+        } else if !in_hunk || line.starts_with("+++") || line.starts_with("---") {
+            out.push(PatchLine {
+                line: None,
+                text: line.to_string(),
+            });
+        } else if line.starts_with('+') {
+            out.push(PatchLine {
+                line: Some(new),
+                text: line.to_string(),
+            });
+            new = new.saturating_add(1);
+        } else if line.starts_with('-') {
+            out.push(PatchLine {
+                line: Some(old),
+                text: line.to_string(),
+            });
+            old = old.saturating_add(1);
+        } else if line.starts_with('\\') {
+            out.push(PatchLine {
+                line: None,
+                text: line.to_string(),
+            });
+        } else {
+            out.push(PatchLine {
+                line: Some(new),
+                text: line.to_string(),
+            });
+            old = old.saturating_add(1);
+            new = new.saturating_add(1);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Totals {
     pub input: f64,

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use ade_core::state::MessageEntry;
 use ade_core::{Command, ConnState, PermissionResponse, RuntimeHandle, Store, WorktreeStatus};
+use ade_core::{DiffNote, parse_patch_lines};
 use gpui::*;
 use gpui_component::{
     ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
@@ -45,6 +46,8 @@ pub struct AdeApp {
     right_tab: RightTab,
     selected_part: Option<String>,
     model_ix: Option<usize>,
+    diff_notes: Vec<DiffNote>,
+    annotate_target: Option<(String, String, u32)>,
 }
 
 impl AdeApp {
@@ -55,8 +58,12 @@ impl AdeApp {
                 .auto_grow(1, 5)
         });
         cx.subscribe_in(&input, window, |this, _, ev, window, cx| {
-            if matches!(ev, InputEvent::PressEnter { .. }) && !this.store.is_busy() {
-                this.send_prompt(window, cx);
+            if matches!(ev, InputEvent::PressEnter { .. }) {
+                if this.annotate_target.is_some() {
+                    this.submit_annotate(window, cx);
+                } else if !this.store.is_busy() {
+                    this.send_prompt(window, cx);
+                }
             }
         })
         .detach();
@@ -88,6 +95,8 @@ impl AdeApp {
             right_tab: RightTab::Context,
             selected_part: None,
             model_ix: None,
+            diff_notes: Vec::new(),
+            annotate_target: None,
         }
     }
 
@@ -110,6 +119,26 @@ impl AdeApp {
         }
         self.rt.send(Command::FanOut { text });
         self.input.update(cx, |st, cx| st.set_value("", window, cx));
+    }
+
+    /// Submit the composer text as a review note on the targeted diff line.
+    fn submit_annotate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((sid, file, line)) = self.annotate_target.clone() else {
+            return;
+        };
+        let text = self.input.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.diff_notes.push(DiffNote {
+            session_id: sid,
+            file,
+            line,
+            text: text.trim().to_string(),
+        });
+        self.annotate_target = None;
+        self.input.update(cx, |st, cx| st.set_value("", window, cx));
+        cx.notify();
     }
 
     fn flat_models(&self) -> Vec<(String, String)> {
@@ -691,51 +720,82 @@ impl AdeApp {
 
     fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.store.is_busy();
+        let annotating = self.annotate_target.clone();
 
         let send = cx.listener(|this, _: &ClickEvent, window, cx| this.send_prompt(window, cx));
+        let annotate =
+            cx.listener(|this, _: &ClickEvent, window, cx| this.submit_annotate(window, cx));
         let fanout = cx.listener(|this, _: &ClickEvent, window, cx| this.send_fan_out(window, cx));
         let abort = cx.listener(|this, _: &ClickEvent, _, _| this.rt.send(Command::Abort));
 
         div()
             .flex_none()
             .flex()
-            .items_end()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .child(div().flex_1().min_w_0().child(Input::new(&self.input)))
-            .children(if busy {
-                vec![
-                    Button::new("abort")
-                        .label("Abort")
-                        .small()
-                        .on_click(abort)
-                        .into_any_element(),
-                ]
-            } else {
-                vec![
-                    Button::new("send")
-                        .label("Send ⏎")
-                        .small()
-                        .disabled(self.store.active_session.is_none())
-                        .on_click(send)
-                        .into_any_element(),
-                    Button::new("fanout")
-                        .label("⇉ all")
-                        .small()
-                        .disabled(
-                            !self
-                                .store
-                                .worktrees
-                                .values()
-                                .any(|r| r.session_id.is_some()),
-                        )
-                        .on_click(fanout)
-                        .into_any_element(),
-                ]
-            })
+            .flex_col()
+            .children(annotating.clone().map(|(sid, file, line)| {
+                let short: String = sid.chars().take(8).collect();
+                div()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(warn_color())
+                    .child(
+                        Label::new(format!("✎ note on {file}:{line} ({short}) — type + Enter"))
+                            .text_size(px(11.))
+                            .text_color(warn_color()),
+                    )
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.input)))
+                    .children(if busy {
+                        vec![
+                            Button::new("abort")
+                                .label("Abort")
+                                .small()
+                                .on_click(abort)
+                                .into_any_element(),
+                        ]
+                    } else if annotating.is_some() {
+                        vec![
+                            Button::new("annotate-send")
+                                .label("Annotate ⏎")
+                                .small()
+                                .on_click(annotate)
+                                .into_any_element(),
+                        ]
+                    } else {
+                        vec![
+                            Button::new("send")
+                                .label("Send ⏎")
+                                .small()
+                                .disabled(self.store.active_session.is_none())
+                                .on_click(send)
+                                .into_any_element(),
+                            Button::new("fanout")
+                                .label("⇉ all")
+                                .small()
+                                .disabled(
+                                    !self
+                                        .store
+                                        .worktrees
+                                        .values()
+                                        .any(|r| r.session_id.is_some()),
+                                )
+                                .on_click(fanout)
+                                .into_any_element(),
+                        ]
+                    }),
+            )
     }
 }
 
@@ -793,7 +853,7 @@ impl AdeApp {
         let body: AnyElement = match self.right_tab {
             RightTab::Context => context_view(&self.store, cx),
             RightTab::Inspector => inspector_view(self.selected_part.as_deref()),
-            RightTab::Diff => diff_view(&self.store),
+            RightTab::Diff => self.render_diff(cx),
         };
 
         div()
@@ -902,88 +962,178 @@ struct FileDiffRow {
     patch: Option<String>,
 }
 
-fn file_diff_block(d: &FileDiffRow) -> impl IntoElement {
-    let name = d.file.clone().unwrap_or_else(|| "(unknown)".into());
-    div()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .child(Label::new(format!(
+impl AdeApp {
+    fn file_diff_block(
+        &self,
+        sid: &str,
+        file_idx: usize,
+        d: &FileDiffRow,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let name = d.file.clone().unwrap_or_else(|| "(unknown)".into());
+        let mut block = div().flex().flex_col().gap_0p5().child(Label::new(format!(
             "{name}  +{} −{}",
             d.additions.unwrap_or(0.),
             d.deletions.unwrap_or(0.)
-        )))
-        .children(d.patch.clone().map(|patch| {
-            let mut block = div().flex().flex_col();
-            for line in patch.lines().take(400) {
-                let color = if line.starts_with('+') && !line.starts_with("+++") {
+        )));
+        if let Some(patch) = d.patch.clone() {
+            let mut lines = div().flex().flex_col();
+            for (li, pl) in parse_patch_lines(&patch).iter().take(400).enumerate() {
+                let color = if pl.text.starts_with('+') && !pl.text.starts_with("+++") {
                     ok_color()
-                } else if line.starts_with('-') && !line.starts_with("---") {
+                } else if pl.text.starts_with('-') && !pl.text.starts_with("---") {
                     bad_color()
-                } else if line.starts_with("@@") {
+                } else if pl.text.starts_with("@@") {
                     rgba(0xb18cf0ff)
                 } else {
                     muted_color()
                 };
-                block = block.child(Label::new(line.to_string()).text_color(color));
+                let row = div().child(Label::new(pl.text.clone()).text_color(color));
+                match pl.line {
+                    Some(n) => {
+                        let target = (sid.to_string(), name.clone(), n);
+                        let set = cx.listener(move |app, _: &ClickEvent, _, cx| {
+                            app.annotate_target = Some(target.clone());
+                            cx.notify();
+                        });
+                        lines = lines.child(
+                            row.id(SharedString::from(format!("dl-{sid}-{file_idx}-{li}")))
+                                .cursor_pointer()
+                                .on_click(set),
+                        );
+                    }
+                    None => {
+                        lines = lines.child(row);
+                    }
+                }
             }
-            block
-        }))
-}
-
-fn diff_view(store: &Store) -> AnyElement {
-    if store.diffs.is_empty() {
-        return v_center("No diffs yet — press ↻ all to fetch.");
+            block = block.child(lines);
+        }
+        // Notes attached to this file.
+        for (idx, note) in self
+            .diff_notes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.session_id == sid && n.file == name)
+        {
+            let drop = cx.listener(move |app, _: &ClickEvent, _, cx| {
+                app.diff_notes.remove(idx);
+                cx.notify();
+            });
+            block = block.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pl_2()
+                    .child(
+                        Label::new(format!("✎ L{}: {}", note.line, truncate(&note.text, 120)))
+                            .text_size(px(11.))
+                            .text_color(warn_color()),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("note-del-{idx}")))
+                            .label("×")
+                            .xsmall()
+                            .compact()
+                            .on_click(drop),
+                    ),
+            );
+        }
+        block
     }
-    // Group sessions with diffs by scope: worktrees first, then root.
-    let mut scopes: Vec<String> = store
-        .diffs
-        .keys()
-        .map(|sid| store.scope_of(sid).to_string())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    scopes.sort_by_key(|s| (!s.is_empty(), s.clone()));
 
-    let mut col = div().flex().flex_col().gap_2();
-    for scope in scopes {
-        let header = if scope.is_empty() {
-            "main".to_string()
-        } else {
-            format!("⑂ {scope}")
-        };
-        let mut section = div().flex().flex_col().gap_1().child(
-            Label::new(header)
-                .text_size(px(12.))
-                .text_color(warn_color()),
-        );
-        let mut sids: Vec<_> = store
+    fn render_diff(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.store.diffs.is_empty() {
+            return v_center("No diffs yet — press ↻ all to fetch.");
+        }
+        // Group sessions with diffs by scope: worktrees first, then root.
+        let mut scopes: Vec<String> = self
+            .store
             .diffs
             .keys()
-            .filter(|sid| store.scope_of(sid) == scope)
-            .cloned()
+            .map(|sid| self.store.scope_of(sid).to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect();
-        sids.sort();
-        for sid in sids {
-            let Some(value) = store.diffs.get(&sid) else {
-                continue;
+        scopes.sort_by_key(|s| (!s.is_empty(), s.clone()));
+
+        let mut col = div().flex().flex_col().gap_2();
+        for scope in scopes {
+            let header = if scope.is_empty() {
+                "main".to_string()
+            } else {
+                format!("⑂ {scope}")
             };
-            let Ok(rows) = serde_json::from_value::<Vec<FileDiffRow>>(value.clone()) else {
-                continue;
-            };
-            let short: String = sid.chars().take(12).collect();
-            section = section.child(
-                Label::new(format!("{short} · {} file(s)", rows.len()))
-                    .text_size(px(11.))
-                    .text_color(muted_color()),
+            let mut section = div().flex().flex_col().gap_1().child(
+                Label::new(header)
+                    .text_size(px(12.))
+                    .text_color(warn_color()),
             );
-            for d in &rows {
-                section = section.child(file_diff_block(d));
+            let mut sids: Vec<_> = self
+                .store
+                .diffs
+                .keys()
+                .filter(|sid| self.store.scope_of(sid) == scope)
+                .cloned()
+                .collect();
+            sids.sort();
+            for sid in sids {
+                let notes: Vec<DiffNote> = self
+                    .diff_notes
+                    .iter()
+                    .filter(|n| n.session_id == sid)
+                    .cloned()
+                    .collect();
+                let short: String = sid.chars().take(12).collect();
+                let mut head = div().flex().items_center().justify_between().child(
+                    Label::new(short.to_string())
+                        .text_size(px(11.))
+                        .text_color(muted_color()),
+                );
+                if !notes.is_empty() {
+                    let send_sid = sid.clone();
+                    let send_notes = cx.listener(move |app, _: &ClickEvent, _, _| {
+                        let mine: Vec<DiffNote> = app
+                            .diff_notes
+                            .iter()
+                            .filter(|n| n.session_id == send_sid)
+                            .cloned()
+                            .collect();
+                        app.diff_notes.retain(|n| n.session_id != send_sid);
+                        app.rt.send(Command::SendNotes {
+                            session_id: send_sid.clone(),
+                            notes: mine,
+                        });
+                    });
+                    head = head.child(
+                        Button::new(SharedString::from(format!("notes-send-{short}")))
+                            .label(format!("Send {} notes → agent", notes.len()))
+                            .xsmall()
+                            .compact()
+                            .on_click(send_notes),
+                    );
+                }
+                section = section.child(head);
+                let Some(value) = self.store.diffs.get(&sid) else {
+                    continue;
+                };
+                let Ok(rows) = serde_json::from_value::<Vec<FileDiffRow>>(value.clone()) else {
+                    continue;
+                };
+                section = section.child(
+                    Label::new(format!("{} file(s) — click a line to annotate", rows.len()))
+                        .text_size(px(11.))
+                        .text_color(muted_color()),
+                );
+                for (fi, d) in rows.iter().enumerate() {
+                    section = section.child(self.file_diff_block(&sid, fi, d, cx));
+                }
             }
+            col = col.child(section);
         }
-        col = col.child(section);
+        col.into_any_element()
     }
-    col.into_any_element()
 }
 
 // ------------------------------------------------------------ permission
