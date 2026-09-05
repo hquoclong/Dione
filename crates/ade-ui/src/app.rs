@@ -103,6 +103,15 @@ impl AdeApp {
         self.input.update(cx, |st, cx| st.set_value("", window, cx));
     }
 
+    fn send_fan_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.rt.send(Command::FanOut { text });
+        self.input.update(cx, |st, cx| st.set_value("", window, cx));
+    }
+
     fn flat_models(&self) -> Vec<(String, String)> {
         self.store
             .providers
@@ -684,6 +693,7 @@ impl AdeApp {
         let busy = self.store.is_busy();
 
         let send = cx.listener(|this, _: &ClickEvent, window, cx| this.send_prompt(window, cx));
+        let fanout = cx.listener(|this, _: &ClickEvent, window, cx| this.send_fan_out(window, cx));
         let abort = cx.listener(|this, _: &ClickEvent, _, _| this.rt.send(Command::Abort));
 
         div()
@@ -711,6 +721,18 @@ impl AdeApp {
                         .small()
                         .disabled(self.store.active_session.is_none())
                         .on_click(send)
+                        .into_any_element(),
+                    Button::new("fanout")
+                        .label("⇉ all")
+                        .small()
+                        .disabled(
+                            !self
+                                .store
+                                .worktrees
+                                .values()
+                                .any(|r| r.session_id.is_some()),
+                        )
+                        .on_click(fanout)
                         .into_any_element(),
                 ]
             })
@@ -756,18 +778,15 @@ impl AdeApp {
             );
         }
         if self.right_tab == RightTab::Diff {
-            let sid = self.store.active_session.clone();
-            let fetch = cx.listener(move |app, _: &ClickEvent, _, _| {
-                if let Some(id) = sid.clone() {
-                    app.rt.send(Command::FetchDiff(id));
-                }
+            let fetch_all = cx.listener(move |app, _: &ClickEvent, _, _| {
+                app.rt.send(Command::FetchAllDiffs);
             });
             header = header.child(
                 Button::new("diff-fetch")
-                    .label("↻")
+                    .label("↻ all")
                     .xsmall()
                     .compact()
-                    .on_click(fetch),
+                    .on_click(fetch_all),
             );
         }
 
@@ -883,46 +902,86 @@ struct FileDiffRow {
     patch: Option<String>,
 }
 
+fn file_diff_block(d: &FileDiffRow) -> impl IntoElement {
+    let name = d.file.clone().unwrap_or_else(|| "(unknown)".into());
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .child(Label::new(format!(
+            "{name}  +{} −{}",
+            d.additions.unwrap_or(0.),
+            d.deletions.unwrap_or(0.)
+        )))
+        .children(d.patch.clone().map(|patch| {
+            let mut block = div().flex().flex_col();
+            for line in patch.lines().take(400) {
+                let color = if line.starts_with('+') && !line.starts_with("+++") {
+                    ok_color()
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    bad_color()
+                } else if line.starts_with("@@") {
+                    rgba(0xb18cf0ff)
+                } else {
+                    muted_color()
+                };
+                block = block.child(Label::new(line.to_string()).text_color(color));
+            }
+            block
+        }))
+}
+
 fn diff_view(store: &Store) -> AnyElement {
     if store.diffs.is_empty() {
-        return v_center("No diff yet — press ↻ to fetch.");
+        return v_center("No diffs yet — press ↻ all to fetch.");
     }
-    let mut col = div().flex().flex_col().gap_2();
+    // Group sessions with diffs by scope: worktrees first, then root.
+    let mut scopes: Vec<String> = store
+        .diffs
+        .keys()
+        .map(|sid| store.scope_of(sid).to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    scopes.sort_by_key(|s| (!s.is_empty(), s.clone()));
 
-    for value in store.diffs.values() {
-        let Ok(rows) = serde_json::from_value::<Vec<FileDiffRow>>(value.clone()) else {
-            continue;
+    let mut col = div().flex().flex_col().gap_2();
+    for scope in scopes {
+        let header = if scope.is_empty() {
+            "main".to_string()
+        } else {
+            format!("⑂ {scope}")
         };
-        for d in rows {
-            let name = d.file.unwrap_or_else(|| "(unknown)".into());
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(Label::new(format!(
-                        "{name}  +{} −{}",
-                        d.additions.unwrap_or(0.),
-                        d.deletions.unwrap_or(0.)
-                    )))
-                    .children(d.patch.map(|patch| {
-                        let mut block = div().flex().flex_col();
-                        for line in patch.lines().take(400) {
-                            let color = if line.starts_with('+') && !line.starts_with("+++") {
-                                ok_color()
-                            } else if line.starts_with('-') && !line.starts_with("---") {
-                                bad_color()
-                            } else if line.starts_with("@@") {
-                                rgba(0xb18cf0ff)
-                            } else {
-                                muted_color()
-                            };
-                            block = block.child(Label::new(line.to_string()).text_color(color));
-                        }
-                        block
-                    })),
+        let mut section = div().flex().flex_col().gap_1().child(
+            Label::new(header)
+                .text_size(px(12.))
+                .text_color(warn_color()),
+        );
+        let mut sids: Vec<_> = store
+            .diffs
+            .keys()
+            .filter(|sid| store.scope_of(sid) == scope)
+            .cloned()
+            .collect();
+        sids.sort();
+        for sid in sids {
+            let Some(value) = store.diffs.get(&sid) else {
+                continue;
+            };
+            let Ok(rows) = serde_json::from_value::<Vec<FileDiffRow>>(value.clone()) else {
+                continue;
+            };
+            let short: String = sid.chars().take(12).collect();
+            section = section.child(
+                Label::new(format!("{short} · {} file(s)", rows.len()))
+                    .text_size(px(11.))
+                    .text_color(muted_color()),
             );
+            for d in &rows {
+                section = section.child(file_diff_block(d));
+            }
         }
+        col = col.child(section);
     }
     col.into_any_element()
 }

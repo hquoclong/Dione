@@ -54,6 +54,23 @@ pub struct SelectedModel {
     pub id: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffNote {
+    pub session_id: String,
+    pub file: String,
+    pub line: u32,
+    pub text: String,
+}
+
+/// Format review notes as a prompt body for the agent.
+pub fn format_review_notes(notes: &[DiffNote]) -> String {
+    let mut out = String::from("Review feedback — please address each item:\n");
+    for n in notes {
+        out.push_str(&format!("- {}:{} — {}\n", n.file, n.line, n.text));
+    }
+    out
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Totals {
     pub input: f64,

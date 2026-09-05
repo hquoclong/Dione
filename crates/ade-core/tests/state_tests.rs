@@ -303,3 +303,26 @@ fn sessions_group_by_scope() {
     assert_eq!(s.sessions_in_scope(""), vec!["ses_3".to_string()]);
     assert_eq!(s.scope_of("ses_9"), "");
 }
+
+#[test]
+fn format_review_notes_renders_items() {
+    use ade_core::state::{DiffNote, format_review_notes};
+
+    let notes = vec![
+        DiffNote {
+            session_id: "ses_1".into(),
+            file: "a.rs".into(),
+            line: 12,
+            text: "rename this".into(),
+        },
+        DiffNote {
+            session_id: "ses_1".into(),
+            file: "b.rs".into(),
+            line: 3,
+            text: "add test".into(),
+        },
+    ];
+    let body = format_review_notes(&notes);
+    assert!(body.contains("a.rs:12 — rename this"));
+    assert!(body.contains("b.rs:3 — add test"));
+}

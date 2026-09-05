@@ -47,8 +47,16 @@ pub enum Command {
     Prompt {
         text: String,
     },
+    FanOut {
+        text: String,
+    },
     Abort,
     FetchDiff(String),
+    FetchAllDiffs,
+    SendNotes {
+        session_id: String,
+        notes: Vec<crate::state::DiffNote>,
+    },
     PermissionReply {
         permission_id: String,
         response: PermissionResponse,
@@ -398,10 +406,19 @@ async fn handle_command(st: &mut LoopState, slot: &Arc<RwLock<Arc<Store>>>, cmd:
             let sid = st.store.active_session.clone();
             if let Some(sid) = sid {
                 let client = st.client_for(&sid).clone();
-                prompt(st, &client, text).await;
+                prompt_session(st, &client, &sid, text).await;
             } else {
                 st.store.push_error("no active session — create one first");
             }
+        }
+        Command::FanOut { text } => fan_out(st, text).await,
+        Command::SendNotes { session_id, notes } => {
+            if notes.is_empty() {
+                return true;
+            }
+            let client = st.client_for(&session_id).clone();
+            let body = crate::state::format_review_notes(&notes);
+            prompt_session(st, &client, &session_id, body).await;
         }
         Command::Abort => {
             if let Some(sid) = st.store.active_session.clone() {
@@ -429,15 +446,13 @@ async fn handle_command(st: &mut LoopState, slot: &Arc<RwLock<Arc<Store>>>, cmd:
         }
         Command::FetchDiff(sid) => {
             let client = st.client_for(&sid).clone();
-            let path = format!("/session/{sid}/diff");
-            match client
-                .request::<serde_json::Value>(reqwest::Method::GET, &path, None)
-                .await
-            {
-                Ok(v) => {
-                    st.store.diffs.insert(sid, v);
-                }
-                Err(e) => st.store.push_error(format!("diff fetch failed: {e:#}")),
+            fetch_diff(st, &client, &sid).await;
+        }
+        Command::FetchAllDiffs => {
+            let sids: Vec<String> = st.store.sessions.keys().cloned().collect();
+            for sid in sids {
+                let client = st.client_for(&sid).clone();
+                fetch_diff(st, &client, &sid).await;
             }
         }
         Command::SetModel {
@@ -561,11 +576,58 @@ async fn select_worktree(st: &mut LoopState, slug: &str) {
     }
 }
 
-async fn prompt(st: &mut LoopState, client: &OpencodeClient, text: String) {
-    let Some(sid) = st.store.active_session.clone() else {
-        st.store.push_error("no active session — create one first");
+/// Send one prompt to every worktree-linked session, skipping busy ones.
+async fn fan_out(st: &mut LoopState, text: String) {
+    let targets: Vec<(String, String)> = st
+        .store
+        .session_scope
+        .iter()
+        .filter(|(_, scope)| !scope.is_empty())
+        .map(|(id, scope)| (id.clone(), scope.clone()))
+        .collect();
+    if targets.is_empty() {
+        st.store
+            .push_error("fan-out needs at least one worktree session");
         return;
-    };
+    }
+    let mut sent = 0;
+    for (sid, scope) in targets {
+        if st
+            .store
+            .statuses
+            .get(&sid)
+            .is_some_and(|s| matches!(s, SessionStatus::Busy | SessionStatus::Retry { .. }))
+        {
+            st.store
+                .push_error(format!("fan-out skipped {scope}: busy"));
+            continue;
+        }
+        let client = st
+            .clients
+            .get(&scope)
+            .or_else(|| st.clients.get(ROOT_SCOPE))
+            .cloned()
+            .expect("root client always present");
+        prompt_session(st, &client, &sid, text.clone()).await;
+        sent += 1;
+    }
+    tracing::info!("fan-out sent to {sent} worktree sessions");
+}
+
+async fn fetch_diff(st: &mut LoopState, client: &OpencodeClient, sid: &str) {
+    let path = format!("/session/{sid}/diff");
+    match client
+        .request::<serde_json::Value>(reqwest::Method::GET, &path, None)
+        .await
+    {
+        Ok(v) => {
+            st.store.diffs.insert(sid.to_string(), v);
+        }
+        Err(e) => st.store.push_error(format!("diff fetch failed: {e:#}")),
+    }
+}
+
+async fn prompt_session(st: &mut LoopState, client: &OpencodeClient, sid: &str, text: String) {
     let params = PromptAsyncParams {
         agent: None,
         format: None,
@@ -592,13 +654,15 @@ async fn prompt(st: &mut LoopState, client: &OpencodeClient, text: String) {
         tools: None,
         variant: None,
     };
-    match client.prompt_async(&sid, &params).await {
+    match client.prompt_async(sid, &params).await {
         Err(e) => {
             st.store.push_error(format!("prompt failed: {e:#}"));
         }
         Ok(()) => {
             // Optimistically mark busy; authoritative status arrives via SSE/poll.
-            st.store.statuses.insert(sid, SessionStatus::Busy);
+            st.store
+                .statuses
+                .insert(sid.to_string(), SessionStatus::Busy);
         }
     }
 }
