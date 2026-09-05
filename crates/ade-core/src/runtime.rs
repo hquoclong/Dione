@@ -1,9 +1,12 @@
-//! M1 runtime: own thread + tokio loop driving `opencode serve`.
+//! M2 runtime: one `opencode serve`, one client per directory.
 //!
 //! UI thread sends [`Command`]s; the loop mutates a [`Store`] and publishes
 //! `Arc<Store>` snapshots. SSE is best-effort — every `Connected` frame and
-//! every poll tick reconciles via REST.
+//! every poll tick reconciles via REST. Each worktree gets a directory-scoped
+//! client plus its own SSE pump; routing is by `Store::session_scope`.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -19,6 +22,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::config::AppConfig;
 use crate::server::AdeServer;
 use crate::state::{ConnState, MessageEntry, SelectedModel, Store};
+use crate::worktree::{self, WorktreeRecord};
+
+/// Scope key for the repo root (no worktree).
+const ROOT_SCOPE: &str = "";
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -27,6 +34,15 @@ pub enum Command {
     },
     SelectSession {
         id: String,
+    },
+    CreateWorktree {
+        slug: String,
+    },
+    RemoveWorktree {
+        slug: String,
+    },
+    SelectWorktree {
+        slug: String,
     },
     Prompt {
         text: String,
@@ -130,13 +146,82 @@ async fn outer_loop(
 
 struct LoopState {
     store: Store,
+    base_url: String,
+    repo: PathBuf,
+    /// Scope ("" = root, else worktree slug) -> directory-scoped client.
+    clients: BTreeMap<String, OpencodeClient>,
+    pumped: BTreeSet<String>,
 }
 
 impl LoopState {
     fn load(slot: &RwLock<Arc<Store>>) -> Self {
         let store = slot.read().map(|g| (**g).clone()).unwrap_or_default();
-        Self { store }
+        Self {
+            store,
+            base_url: String::new(),
+            repo: PathBuf::from("."),
+            clients: BTreeMap::new(),
+            pumped: BTreeSet::new(),
+        }
     }
+
+    fn client_for(&self, sid: &str) -> &OpencodeClient {
+        let scope = self.store.scope_of(sid);
+        self.clients
+            .get(scope)
+            .or_else(|| self.clients.get(ROOT_SCOPE))
+            .expect("root client always present")
+    }
+}
+
+fn build_client(base_url: &str, dir: Option<&std::path::Path>) -> anyhow::Result<OpencodeClient> {
+    let mut b = OpencodeClient::builder()
+        .base_url(base_url)
+        .auth_from_env()
+        .timeout(Duration::from_secs(60));
+    if let Some(d) = dir {
+        b = b.directory(d.to_string_lossy().into_owned());
+    }
+    Ok(b.build()?)
+}
+
+/// Get (or lazily build + pump) the client for a scope.
+fn ensure_client(
+    st: &mut LoopState,
+    slot: &Arc<RwLock<Arc<Store>>>,
+    scope: &str,
+) -> anyhow::Result<OpencodeClient> {
+    if let Some(c) = st.clients.get(scope) {
+        return Ok(c.clone());
+    }
+    let dir = if scope.is_empty() {
+        None
+    } else {
+        Some(worktree::worktree_path(&st.repo, scope))
+    };
+    let client = build_client(&st.base_url, dir.as_deref())?;
+    st.clients.insert(scope.to_string(), client.clone());
+    spawn_pump(
+        client.clone(),
+        Arc::clone(slot),
+        scope.to_string(),
+        &mut st.pumped,
+    );
+    Ok(client)
+}
+
+fn spawn_pump(
+    client: OpencodeClient,
+    slot: Arc<RwLock<Arc<Store>>>,
+    scope: String,
+    pumped: &mut BTreeSet<String>,
+) {
+    if !pumped.insert(scope.clone()) {
+        return;
+    }
+    tokio::spawn(async move {
+        sse_pump(client, slot, scope).await;
+    });
 }
 
 fn publish(slot: &RwLock<Arc<Store>>, st: &LoopState) {
@@ -153,16 +238,18 @@ async fn run_session(
 ) {
     let client = server.client.clone();
     let mut st = LoopState::load(slot);
+    st.base_url = server.base_url.clone();
+    st.repo = config.project_dir.clone();
+    st.clients.insert(ROOT_SCOPE.to_string(), client.clone());
+    spawn_pump(
+        client.clone(),
+        Arc::clone(slot),
+        ROOT_SCOPE.to_string(),
+        &mut st.pumped,
+    );
 
-    bootstrap(&mut st, &client).await;
+    bootstrap(&mut st).await;
     publish(slot, &st);
-
-    // SSE pump: applies events live; reconciles on every (re)connect.
-    let pump_client = client.clone();
-    let pump_slot = Arc::clone(slot);
-    tokio::spawn(async move {
-        sse_pump(pump_client, pump_slot).await;
-    });
 
     let mut poll = tokio::time::interval(Duration::from_millis(config.poll_interval_ms));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -172,21 +259,21 @@ async fn run_session(
         tokio::select! {
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { return }; // UI gone: end session loop.
-                if !handle_command(&mut st, &client, cmd).await {
+                if !handle_command(&mut st, slot, cmd).await {
                     return;
                 }
                 publish(slot, &st);
             }
             _ = poll.tick() => {
                 tick += 1;
-                poll_once(&mut st, &client, tick).await;
+                poll_once(&mut st, tick).await;
                 publish(slot, &st);
             }
         }
     }
 }
 
-async fn sse_pump(client: OpencodeClient, slot: Arc<RwLock<Arc<Store>>>) {
+async fn sse_pump(client: OpencodeClient, slot: Arc<RwLock<Arc<Store>>>, scope: String) {
     let retry = RetryConfig {
         initial_interval: Duration::from_millis(500),
         max_interval: Duration::from_secs(10),
@@ -205,14 +292,22 @@ async fn sse_pump(client: OpencodeClient, slot: Arc<RwLock<Arc<Store>>>) {
     while let Some(item) = stream.next().await {
         match item {
             Ok(StreamEvent::Connected) => {
+                // Reconcile every session in this pump's scope (usually one).
                 let mut st = LoopState::load(&slot);
-                if let Some(sid) = st.store.active_session.clone() {
+                let scopes: Vec<String> = st
+                    .store
+                    .session_scope
+                    .iter()
+                    .filter(|(_, s)| *s == &scope)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for sid in scopes {
                     reconcile_messages(&mut st, &client, &sid).await;
                 }
                 publish(&slot, &st);
             }
             Ok(StreamEvent::Event(ev)) => {
-                apply_stream_event(&client, &slot, *ev).await;
+                apply_stream_event(&client, &slot, *ev, scope.clone()).await;
             }
             Ok(_) => {}
             Err(e) => {
@@ -227,8 +322,21 @@ async fn sse_pump(client: OpencodeClient, slot: Arc<RwLock<Arc<Store>>>) {
     publish(&slot, &st);
 }
 
-async fn apply_stream_event(client: &OpencodeClient, slot: &Arc<RwLock<Arc<Store>>>, ev: Event) {
+async fn apply_stream_event(
+    client: &OpencodeClient,
+    slot: &Arc<RwLock<Arc<Store>>>,
+    ev: Event,
+    scope: String,
+) {
     let mut st = LoopState::load(slot);
+    // Attribute newly-seen sessions to this pump's scope (reconcile fixes
+    // any misattribution; the scope map is advisory for routing).
+    if let Event::SessionCreated(e) = &ev {
+        st.store
+            .session_scope
+            .entry(e.properties.info.id.clone())
+            .or_insert_with(|| scope.clone());
+    }
     // Permission + todo frames carry full data — no extra fetch needed.
     // Message frames only patch the mirror; the poll tick reconciles fully.
     st.store.apply_event(&ev);
@@ -236,67 +344,91 @@ async fn apply_stream_event(client: &OpencodeClient, slot: &Arc<RwLock<Arc<Store
         ev,
         Event::SessionCreated(_) | Event::SessionDeleted(_) | Event::SessionIdle(_)
     ) {
-        reconcile_sessions(&mut st, client).await;
+        reconcile_scoped_sessions(&mut st, client, &scope).await;
     }
     publish(slot, &st);
 }
 
-async fn poll_once(st: &mut LoopState, client: &OpencodeClient, tick: u64) {
-    reconcile_sessions(st, client).await;
-    if let Some(sid) = st.store.active_session.clone() {
-        reconcile_messages(st, client, &sid).await;
-        fetch_todos(st, client, &sid).await;
+async fn poll_once(st: &mut LoopState, tick: u64) {
+    reconcile_all_sessions(st).await;
+    let active = st.store.active_session.clone();
+    if let Some(sid) = active {
+        let client = st.client_for(&sid).clone();
+        reconcile_messages(st, &client, &sid).await;
+        fetch_todos(st, &client, &sid).await;
     }
     if tick.is_multiple_of(10) {
-        fetch_providers(st, client).await;
+        let root = st.clients.get(ROOT_SCOPE).cloned();
+        if let Some(client) = root {
+            fetch_providers(st, &client).await;
+        }
     }
 }
 
 /// Returns false when the session loop should end (currently never — all
 /// commands are recoverable).
-async fn handle_command(st: &mut LoopState, client: &OpencodeClient, cmd: Command) -> bool {
+async fn handle_command(st: &mut LoopState, slot: &Arc<RwLock<Arc<Store>>>, cmd: Command) -> bool {
     match cmd {
         Command::CreateSession { title } => {
-            let params = SessionCreateParams {
-                agent: None,
-                metadata: None,
-                model: None,
-                parent_id: None,
-                permission: None,
-                title: Some(title).filter(|t| !t.trim().is_empty()),
-                workspace_id: None,
-            };
-            match client.create_session(&params).await {
-                Ok(s) => {
-                    st.store.active_session = Some(s.id.clone());
-                    st.store.sessions.insert(s.id.clone(), s);
-                    if let Some(sid) = st.store.active_session.clone() {
-                        reconcile_messages(st, client, &sid).await;
-                    }
+            let scope = st.store.active_worktree.clone().unwrap_or_default();
+            match ensure_client(st, slot, &scope) {
+                Err(e) => st
+                    .store
+                    .push_error(format!("worktree client failed: {e:#}")),
+                Ok(client) => {
+                    create_session_in(st, &client, &scope, title).await;
                 }
-                Err(e) => st.store.push_error(format!("create session failed: {e:#}")),
             }
         }
+        Command::CreateWorktree { slug } => create_worktree(st, slot, slug).await,
+        Command::RemoveWorktree { slug } => remove_worktree(st, &slug).await,
+        Command::SelectWorktree { slug } => select_worktree(st, &slug).await,
         Command::SelectSession { id } => {
             if st.store.sessions.contains_key(&id) {
                 st.store.active_session = Some(id.clone());
-                reconcile_messages(st, client, &id).await;
-                fetch_todos(st, client, &id).await;
+                // Keep the worktree highlight in sync with the session.
+                let scope = st.store.scope_of(&id).to_string();
+                st.store.active_worktree = if scope.is_empty() { None } else { Some(scope) };
+                let client = st.client_for(&id).clone();
+                reconcile_messages(st, &client, &id).await;
+                fetch_todos(st, &client, &id).await;
             }
         }
-        Command::Prompt { text } => prompt(st, client, text).await,
+        Command::Prompt { text } => {
+            let sid = st.store.active_session.clone();
+            if let Some(sid) = sid {
+                let client = st.client_for(&sid).clone();
+                prompt(st, &client, text).await;
+            } else {
+                st.store.push_error("no active session — create one first");
+            }
+        }
         Command::Abort => {
-            if let Some(sid) = st.store.active_session.clone()
-                && let Err(e) = client.abort(&sid).await
-            {
-                st.store.push_error(format!("abort failed: {e:#}"));
+            if let Some(sid) = st.store.active_session.clone() {
+                let client = st.client_for(&sid).clone();
+                if let Err(e) = client.abort(&sid).await {
+                    st.store.push_error(format!("abort failed: {e:#}"));
+                }
             }
         }
         Command::PermissionReply {
             permission_id,
             response,
-        } => reply_permission(st, client, permission_id, response).await,
+        } => {
+            let sid = st
+                .store
+                .pending_permissions
+                .get(&permission_id)
+                .map(|p| p.session_id.clone());
+            if let Some(sid) = sid {
+                let client = st.client_for(&sid).clone();
+                reply_permission(st, &client, permission_id, response).await;
+            } else {
+                st.store.push_error("reply for unknown permission");
+            }
+        }
         Command::FetchDiff(sid) => {
+            let client = st.client_for(&sid).clone();
             let path = format!("/session/{sid}/diff");
             match client
                 .request::<serde_json::Value>(reqwest::Method::GET, &path, None)
@@ -319,6 +451,114 @@ async fn handle_command(st: &mut LoopState, client: &OpencodeClient, cmd: Comman
         }
     }
     true
+}
+
+async fn create_session_in(
+    st: &mut LoopState,
+    client: &OpencodeClient,
+    scope: &str,
+    title: String,
+) {
+    let params = SessionCreateParams {
+        agent: None,
+        metadata: None,
+        model: None,
+        parent_id: None,
+        permission: None,
+        title: Some(title).filter(|t| !t.trim().is_empty()),
+        workspace_id: None,
+    };
+    match client.create_session(&params).await {
+        Ok(s) => {
+            st.store
+                .session_scope
+                .insert(s.id.clone(), scope.to_string());
+            st.store.active_session = Some(s.id.clone());
+            st.store.sessions.insert(s.id.clone(), s.clone());
+            if !scope.is_empty()
+                && let Some(record) = st.store.worktrees.get_mut(scope)
+                && record.session_id.is_none()
+            {
+                record.session_id = Some(s.id.clone());
+            }
+            reconcile_messages(st, client, &s.id).await;
+        }
+        Err(e) => st.store.push_error(format!("create session failed: {e:#}")),
+    }
+}
+
+async fn create_worktree(st: &mut LoopState, slot: &Arc<RwLock<Arc<Store>>>, slug: String) {
+    let record = match worktree::create(&st.repo, &slug).await {
+        Ok(r) => r,
+        Err(e) => {
+            st.store
+                .push_error(format!("create worktree failed: {e:#}"));
+            return;
+        }
+    };
+    let slug = record.slug.clone();
+    st.store.upsert_worktree(record);
+    st.store.active_worktree = Some(slug.clone());
+    match ensure_client(st, slot, &slug) {
+        Err(e) => st
+            .store
+            .push_error(format!("worktree client failed: {e:#}")),
+        Ok(client) => {
+            create_session_in(st, &client, &slug, format!("work in {slug}")).await;
+        }
+    }
+}
+
+async fn remove_worktree(st: &mut LoopState, slug: &str) {
+    // Abort + retire every session scoped to this worktree.
+    let sids: Vec<String> = st
+        .store
+        .session_scope
+        .iter()
+        .filter(|(_, s)| *s == slug)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for sid in &sids {
+        if let Some(client) = st
+            .clients
+            .get(slug)
+            .or_else(|| st.clients.get(ROOT_SCOPE))
+            .cloned()
+        {
+            let _ = client.abort(sid).await;
+        }
+        st.store.retire_session(sid);
+    }
+    if let Err(e) = worktree::remove(&st.repo, slug).await {
+        st.store
+            .push_error(format!("remove worktree failed: {e:#}"));
+    }
+    st.store.remove_worktree(slug);
+    st.clients.remove(slug);
+    st.pumped.remove(slug);
+    if st.store.active_worktree.as_deref() == Some(slug) {
+        st.store.active_worktree = st.store.worktrees.keys().next().cloned();
+    }
+}
+
+async fn select_worktree(st: &mut LoopState, slug: &str) {
+    if !st.store.worktrees.contains_key(slug) {
+        return;
+    }
+    st.store.active_worktree = Some(slug.to_string());
+    let sid = st
+        .store
+        .worktrees
+        .get(slug)
+        .and_then(|r| r.session_id.clone());
+    if let Some(sid) = sid
+        && st.store.sessions.contains_key(&sid)
+    {
+        st.store.active_session = Some(sid.clone());
+        let client = st.client_for(&sid).clone();
+        reconcile_messages(st, &client, &sid).await;
+        fetch_todos(st, &client, &sid).await;
+    }
 }
 
 async fn prompt(st: &mut LoopState, client: &OpencodeClient, text: String) {
@@ -400,13 +640,17 @@ async fn reconcile_messages(st: &mut LoopState, client: &OpencodeClient, sid: &s
     }
 }
 
-async fn reconcile_sessions(st: &mut LoopState, client: &OpencodeClient) {
+async fn reconcile_scoped_sessions(st: &mut LoopState, client: &OpencodeClient, scope: &str) {
     match client
         .request::<Vec<Session>>(reqwest::Method::GET, "/session", None)
         .await
     {
         Ok(sessions) => {
             for s in sessions {
+                st.store
+                    .session_scope
+                    .entry(s.id.clone())
+                    .or_insert_with(|| scope.to_string());
                 if st.store.active_session.is_none() {
                     st.store.active_session = Some(s.id.clone());
                 }
@@ -414,6 +658,18 @@ async fn reconcile_sessions(st: &mut LoopState, client: &OpencodeClient) {
             }
         }
         Err(e) => tracing::debug!("session list refresh failed: {e:#}"),
+    }
+}
+
+async fn reconcile_all_sessions(st: &mut LoopState) {
+    // Clone (cheap) so the borrow checker is happy across awaits.
+    let clients: Vec<(String, OpencodeClient)> = st
+        .clients
+        .iter()
+        .map(|(s, c)| (s.clone(), c.clone()))
+        .collect();
+    for (scope, client) in clients {
+        reconcile_scoped_sessions(st, &client, &scope).await;
     }
 }
 
@@ -430,9 +686,40 @@ async fn fetch_todos(st: &mut LoopState, client: &OpencodeClient, sid: &str) {
     }
 }
 
-async fn bootstrap(st: &mut LoopState, client: &OpencodeClient) {
-    reconcile_sessions(st, client).await;
-    fetch_providers(st, client).await;
+async fn bootstrap(st: &mut LoopState) {
+    discover_worktrees(st).await;
+    reconcile_all_sessions(st).await;
+    if let Some(root) = st.clients.get(ROOT_SCOPE).cloned() {
+        fetch_providers(st, &root).await;
+    }
+}
+/// Adopt on-disk managed worktrees (e.g. from a previous run) into the store.
+async fn discover_worktrees(st: &mut LoopState) {
+    let infos = worktree::list(&st.repo).await.unwrap_or_default();
+    for info in infos {
+        if !worktree::is_worktree_path(&info.path) {
+            continue;
+        }
+        let Some(slug) = info
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if st.store.worktrees.contains_key(&slug) {
+            continue;
+        }
+        let branch = info.branch.unwrap_or_else(|| worktree::branch_name(&slug));
+        st.store.upsert_worktree(WorktreeRecord {
+            slug,
+            branch,
+            path: info.path,
+            status: crate::worktree::WorktreeStatus::Creating,
+            session_id: None,
+        });
+    }
 }
 
 /// Parse `GET /provider` defensively — the shape is not in the wrapped spec.

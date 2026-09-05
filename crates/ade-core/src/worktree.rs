@@ -28,6 +28,8 @@ pub struct WorktreeRecord {
     pub branch: String,
     pub path: PathBuf,
     pub status: WorktreeStatus,
+    /// Main opencode session driving this worktree, if any.
+    pub session_id: Option<String>,
 }
 
 impl WorktreeRecord {
@@ -41,6 +43,7 @@ impl WorktreeRecord {
             path: worktree_path(repo, &slug),
             slug,
             status: WorktreeStatus::Creating,
+            session_id: None,
         })
     }
 }
@@ -134,6 +137,7 @@ pub async fn create(repo: &Path, raw_slug: &str) -> Result<WorktreeRecord, Workt
         branch,
         path,
         status: WorktreeStatus::Creating,
+        session_id: None,
     })
 }
 

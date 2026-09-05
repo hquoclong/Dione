@@ -9,4 +9,6 @@ pub use config::AppConfig;
 pub use runtime::{Command, PermissionResponse, RuntimeHandle};
 pub use state::{
     ConnState, MessageEntry, PendingPermission, ProviderInfo, SelectedModel, Store, Totals,
+    event_session_id,
 };
+pub use worktree::WorktreeStatus;

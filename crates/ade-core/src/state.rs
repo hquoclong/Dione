@@ -1,13 +1,13 @@
 //! M1 store: worktrees (M0) + sessions/messages/permissions/diffs.
-//! Fleet dashboard (M2) reads `worktrees` + `statuses` from here.
+//! M2 links sessions to worktrees (`session_scope`) for the fleet dashboard.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use opencode_codes::protocol_generated::types::{
     Event, Message, MessageWithParts, Part, Session, SessionStatus, Todo,
 };
 
-use crate::worktree::WorktreeRecord;
+use crate::worktree::{WorktreeRecord, WorktreeStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnState {
@@ -86,6 +86,11 @@ pub struct Store {
     pub selected_model: Option<SelectedModel>,
     pub totals: Totals,
     pub active_session: Option<String>,
+    // M2: session id -> "" (repo root) or worktree slug.
+    pub session_scope: BTreeMap<String, String>,
+    /// Sessions removed with their worktree: stray in-flight SSE frames for
+    /// these ids are ignored instead of resurrecting them.
+    pub retired_sessions: BTreeSet<String>,
 }
 
 impl Store {
@@ -140,6 +145,77 @@ impl Store {
         self.recompute_totals();
     }
 
+    // -- M2: fleet ----------------------------------------------------------
+    /// Scope of a session: `""` for the repo root, else a worktree slug.
+    pub fn scope_of(&self, sid: &str) -> &str {
+        self.session_scope
+            .get(sid)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// Session ids in a scope, newest (by `time.updated`) first.
+    pub fn sessions_in_scope(&self, scope: &str) -> Vec<String> {
+        let mut ids: Vec<(&String, u64)> = self
+            .sessions
+            .iter()
+            .filter(|(id, _)| self.scope_of(id) == scope)
+            .map(|(id, s)| (id, s.time.updated))
+            .collect();
+        ids.sort_by_key(|(_, updated)| std::cmp::Reverse(*updated));
+        ids.into_iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    /// Dashboard status for a worktree, derived from its main session.
+    pub fn worktree_status(&self, slug: &str) -> WorktreeStatus {
+        let Some(record) = self.worktrees.get(slug) else {
+            return WorktreeStatus::Creating;
+        };
+        let Some(sid) = record.session_id.as_deref() else {
+            return WorktreeStatus::Creating;
+        };
+        if self
+            .pending_permissions
+            .values()
+            .any(|p| p.session_id == sid)
+        {
+            return WorktreeStatus::NeedsYou;
+        }
+        match self.statuses.get(sid) {
+            Some(SessionStatus::Busy) | Some(SessionStatus::Retry { .. }) => {
+                WorktreeStatus::Working
+            }
+            _ => {
+                if self.messages.get(sid).is_some_and(|m| !m.is_empty()) {
+                    WorktreeStatus::Done
+                } else {
+                    WorktreeStatus::Creating
+                }
+            }
+        }
+    }
+
+    /// Drop a session and everything mirrored for it; future SSE frames for
+    /// it are ignored. Returns its scope, if known.
+    pub fn retire_session(&mut self, sid: &str) -> Option<String> {
+        self.sessions.remove(sid);
+        self.statuses.remove(sid);
+        self.messages.remove(sid);
+        self.todos.remove(sid);
+        self.diffs.remove(sid);
+        self.pending_permissions.retain(|_, p| p.session_id != sid);
+        if self.active_session.as_deref() == Some(sid) {
+            self.active_session = self.sessions.keys().next().cloned();
+        }
+        for record in self.worktrees.values_mut() {
+            if record.session_id.as_deref() == Some(sid) {
+                record.session_id = None;
+            }
+        }
+        self.retired_sessions.insert(sid.to_string());
+        self.session_scope.remove(sid)
+    }
+
     fn recompute_totals(&mut self) {
         let mut t = Totals::default();
         for entries in self.messages.values() {
@@ -157,7 +233,11 @@ impl Store {
 
     /// Apply one SSE event to the mirror. Best-effort: unknown or
     /// partial frames are ignored — REST reconcile is authoritative.
+    /// Frames for retired sessions (removed worktrees) are dropped.
     pub fn apply_event(&mut self, ev: &Event) {
+        if event_session_id(ev).is_some_and(|id| self.retired_sessions.contains(id)) {
+            return;
+        }
         match ev {
             Event::SessionCreated(e) => {
                 let s = e.properties.info.clone();
@@ -245,6 +325,24 @@ pub fn message_id(m: &Message) -> &str {
     match m {
         Message::User(u) => &u.id,
         Message::Assistant(a) => &a.id,
+    }
+}
+
+/// Session id carried by an event, if any — used to scope pumps and to
+/// drop frames for retired sessions.
+pub fn event_session_id(ev: &Event) -> Option<&str> {
+    match ev {
+        Event::SessionCreated(e) => Some(&e.properties.info.id),
+        Event::SessionUpdated(e) => Some(&e.properties.info.id),
+        Event::SessionDeleted(e) => Some(&e.properties.session_id),
+        Event::SessionStatus(e) => Some(&e.properties.session_id),
+        Event::SessionIdle(e) => Some(&e.properties.session_id),
+        Event::MessageUpdated(e) => Some(&e.properties.session_id),
+        Event::MessagePartUpdated(e) => Some(&e.properties.session_id),
+        Event::PermissionAsked(e) => Some(&e.properties.session_id),
+        Event::PermissionReplied(e) => Some(&e.properties.session_id),
+        Event::TodoUpdated(e) => Some(&e.properties.session_id),
+        _ => None,
     }
 }
 

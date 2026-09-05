@@ -197,3 +197,109 @@ fn session_deleted_falls_back_active() {
     assert!(!s.sessions.contains_key("ses_1"));
     assert_eq!(s.active_session.as_deref(), Some("ses_2"));
 }
+
+#[test]
+fn retired_session_frames_are_dropped() {
+    use ade_core::state::event_session_id;
+
+    let mut s = Store::default();
+    apply(
+        &mut s,
+        json!({
+            "type": "session.created",
+            "id": "evt_1",
+            "properties": {"info": session_json("ses_1"), "sessionID": "ses_1"}
+        }),
+    );
+    s.session_scope.insert("ses_1".into(), "feat-a".into());
+    s.retire_session("ses_1");
+    assert!(!s.sessions.contains_key("ses_1"));
+
+    // A late status frame must not resurrect anything.
+    apply(
+        &mut s,
+        json!({
+            "type": "session.status",
+            "id": "evt_2",
+            "properties": {"sessionID": "ses_1", "status": {"type": "busy"}}
+        }),
+    );
+    assert!(!s.statuses.contains_key("ses_1"));
+
+    // event_session_id covers the variants the pumps route on.
+    let ev: Event = serde_json::from_value(json!({
+        "type": "permission.asked",
+        "id": "evt_3",
+        "properties": {
+            "id": "per_9", "sessionID": "ses_9", "permission": "bash",
+            "patterns": [], "metadata": {}, "always": []
+        }
+    }))
+    .unwrap();
+    assert_eq!(event_session_id(&ev), Some("ses_9"));
+}
+
+#[test]
+fn worktree_status_derives_from_session() {
+    use ade_core::WorktreeStatus;
+    use std::path::Path;
+
+    let mut s = Store::default();
+    let mut r = ade_core::worktree::WorktreeRecord::new(Path::new("/repo"), "feat-a").unwrap();
+    // No session yet -> Creating.
+    s.worktrees.insert(r.slug.clone(), r.clone());
+    assert_eq!(s.worktree_status("feat-a"), WorktreeStatus::Creating);
+
+    // Link a session: no messages, idle -> still Creating.
+    r.session_id = Some("ses_1".into());
+    s.worktrees.insert(r.slug.clone(), r);
+    s.session_scope.insert("ses_1".into(), "feat-a".into());
+    apply(
+        &mut s,
+        json!({
+            "type": "session.created",
+            "id": "evt_1",
+            "properties": {"info": session_json("ses_1"), "sessionID": "ses_1"}
+        }),
+    );
+    assert_eq!(s.worktree_status("feat-a"), WorktreeStatus::Creating);
+
+    // Busy -> Working.
+    s.statuses.insert("ses_1".into(), SessionStatus::Busy);
+    assert_eq!(s.worktree_status("feat-a"), WorktreeStatus::Working);
+
+    // Pending permission beats busy -> NeedsYou.
+    apply(
+        &mut s,
+        json!({
+            "type": "permission.asked",
+            "id": "evt_2",
+            "properties": {
+                "id": "per_1", "sessionID": "ses_1", "permission": "bash",
+                "patterns": [], "metadata": {}, "always": []
+            }
+        }),
+    );
+    assert_eq!(s.worktree_status("feat-a"), WorktreeStatus::NeedsYou);
+}
+
+#[test]
+fn sessions_group_by_scope() {
+    let mut s = Store::default();
+    for id in ["ses_1", "ses_2", "ses_3"] {
+        apply(
+            &mut s,
+            json!({
+                "type": "session.created",
+                "id": format!("evt_{id}"),
+                "properties": {"info": session_json(id), "sessionID": id}
+            }),
+        );
+    }
+    s.session_scope.insert("ses_1".into(), "feat-a".into());
+    s.session_scope.insert("ses_2".into(), "feat-a".into());
+    // ses_3 stays in root scope.
+    assert_eq!(s.sessions_in_scope("feat-a").len(), 2);
+    assert_eq!(s.sessions_in_scope(""), vec!["ses_3".to_string()]);
+    assert_eq!(s.scope_of("ses_9"), "");
+}
