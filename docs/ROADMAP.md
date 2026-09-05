@@ -15,14 +15,15 @@ panel/permission gate/model picker). 15 tests, clippy 0 warnings.
 
 One task = one isolated git worktree, N agents in parallel.
 
-- [ ] `worktree.rs`: real git ops — create (`git worktree add`), list,
-      remove, prune stale, `.worktreeinclude` copy
-- [ ] 1 opencode session per worktree (session ↔ worktree link in Store)
-- [ ] Dashboard: `Needs you / Working / Done` (+ status heartbeat)
+- [x] `worktree.rs`: real git ops — create (`git worktree add`), list,
+      remove, prune stale, `.worktreeinclude` copy (`495e044`)
+- [x] 1 opencode session per worktree (session ↔ worktree link in Store,
+      per-directory clients + SSE pumps) (`90c8a09`)
+- [x] Dashboard: `Needs you / Working / Done` in grouped Fleet sidebar
 - [ ] Fan-out: 1 prompt → N worktrees; compare diffs side-by-side
 - [ ] Annotate diff lines → send batch back to the right agent
 - [ ] Merge winner + prune; keep dirty worktrees for manual recovery
-- [ ] Cap ~15 managed worktrees
+- [x] Cap ~15 managed worktrees (enforced in `worktree::create`)
 
 Conventions: path `<repo>/.ade-worktrees/<slug>`, branch `ade/<slug>`;
 one branch in one worktree; detached HEAD for experiments.

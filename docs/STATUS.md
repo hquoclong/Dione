@@ -2,20 +2,23 @@
 
 ## Current milestone
 
-M2 — Fleet multi-agent (not started).
+M2 — Fleet multi-agent (slices 1+2 done, slice 3: fan-out/compare/merge).
 
 ## Last commit
 
-- `694d7bf` docs: project docs + opencode skills + instructions
-- Pushed to `hquoclong/Dione` (`main`): M0 + M1a + M1b + docs live on GitHub.
-- M1 verified: `cargo check` pass, clippy 0 warnings, 15/15 tests pass,
-  Xvfb smoke shows `ADE — Agentic IDE` 1440x900 with no panic.
+- `90c8a09` feat(m2b): session-worktree link — per-directory clients+pumps,
+  fleet sidebar (`495e044` m2a git ops before it)
+- Verified: check pass, clippy 0 warnings, 22/22 tests pass (incl. 4 real
+  git worktree tests + 3 fleet mapping tests), Xvfb smoke clean.
 
 ## Next up
 
-1. M2 slice 1: real git worktree ops in `worktree.rs` + tests.
-2. Adopt `main` as local branch name (currently `master` tracking
-   `origin/main`) — optional cleanup.
+1. M2 slice 3: fan-out 1 prompt → N worktrees, side-by-side diff compare,
+   annotate → send back, merge winner.
+2. Live Tier A check: run app against real `opencode serve`, create 2
+   worktrees, verify per-directory sessions + pumps (needs provider key
+   for Tier B prompts).
+3. Optional: rename local `master` → `main`.
 
 ## Blockers
 
