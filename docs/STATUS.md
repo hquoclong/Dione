@@ -2,27 +2,28 @@
 
 ## Current milestone
 
-M2 — Fleet multi-agent DONE. Docs v2 (M3–M15 plan) DONE, chưa commit.
+M2 — Fleet multi-agent DONE, Tier A live PASSED. Ready for M3.
 Next: M3a `transcript.rs` (UnifiedMessage/Cost + dual-write mirror).
 
 ## Last commit (đã verify)
 
-- Docs v2: `00-START-HERE`, `GLOSSARY-VI`, `ARCHITECTURE-v2`,
-  `WORKSPACE-VM`, `AGENT-ANY`, `WORKFLOW`, `LABS`, `adr/0001-0004`,
-  `ROADMAP.md` mở rộng M3→M15
+- `bed2d72` feat(m2f): Tier A live test (`tests/live_tier_a.rs`, 196 dòng)
+  — serve thật + 2 worktrees + sessions + diff fetch + merge winner +
+  remove, 2 passed in ~9s, không tốn prompt
+- `41de1a5` docs: v2 plan M3–M15 + specs + ADRs + labs (13 files)
 - Verified: check pass, clippy 0 warnings (ngoài future-incompat của
-  dep `proc-macro-error2`), 26/26 tests pass, `cargo fmt --check` sạch.
-- Trước đó: `7d420e7` feat(m2e) merge winner --no-ff (`04c5dbb` m2d notes,
-  `dc209fb` m2c fan-out/compare); Xvfb smoke clean.
+  dep `proc-macro-error2`), 26/26 unit + Tier A xanh, `cargo fmt` sạch,
+  Xvfb smoke clean (app sống 60s, không panic).
+- Local `master` → `main` (track `origin/main`); dọn worktree `task-1` thừa.
+- Chưa push: local ahead `origin/main` 2 commits (`41de1a5`, `bed2d72`).
 
 ## Next up
 
-1. Live Tier A check: run app against real `opencode serve`, create 2
-   worktrees via `+ wt`, fan-out a prompt, annotate a diff line, merge —
-   needs provider key for prompts (Tier B).
-2. M3 scoping: SSH remote worktrees vs packaging vs usage tracking.
-3. Optional: rename local `master` → `main`.
+1. M3a `transcript.rs`: `UnifiedMessage`/`Cost` + Store dual-write + test
+   mirror (theo `ARCHITECTURE-v2.md`, <250 dòng).
+2. Tier B live prompt: opt-in `ADE_LIVE_PROMPT=1 cargo test -p ade-core
+   --features integration-tests tier_b` — tốn quota, chạy tay khi cần.
 
 ## Blockers
 
-- None for build; live LLM verification needs a provider key.
+- None. Tier B cần user duyệt chi quota (keys đã có sẵn trong env).
