@@ -1,5 +1,8 @@
 # ADE Roadmap
 
+> Chi tiết M3→M15 (agent-agnostic + Workspace/MicroVM). Spec: `ARCHITECTURE-v2.md`,
+> `WORKSPACE-VM.md`, `AGENT-ANY.md`. Cách làm: `WORKFLOW.md`. Labs: `LABS.md`.
+
 ## M0 — Bootstrap ✅ done (`7d8f4e1`)
 
 Workspace, AGENTS.md, `ade-core` worktree/state pure logic, `ade-ui`
@@ -11,7 +14,7 @@ window skeleton opening under Xvfb.
 context view-model, full UI (sidebar/timeline/composer/right
 panel/permission gate/model picker). 15 tests, clippy 0 warnings.
 
-## M2 — Fleet multi-agent ⬅ CURRENT
+## M2 — Fleet multi-agent ✅ done (`7d420e7`)
 
 One task = one isolated git worktree, N agents in parallel.
 
@@ -32,14 +35,82 @@ one branch in one worktree; detached HEAD for experiments.
 Gitignore `.ade-worktrees/` in every target repo (else `git add .` warns
 about embedded repos).
 
-## M3+ — Later (not scheduled)
+## M3 — Agent-agnostic nền (transcript + trait + git-diff)
 
-- SSH remote worktrees, mobile/Telegram ping on agent-done
-- Usage/cost tracking per agent, automations/skills packs
-- Packaging (AppImage/deb), release-size optimization
-- Warp-style `factory.yaml` governance — inspiration only
+UI hết import opencode; diff qua git để mọi agent dùng được.
 
-## Out of scope
+- [ ] `transcript.rs`: `UnifiedMessage`/`Cost`, Store dual-write + test mirror
+- [ ] `agent.rs`: `AgentBackend` trait + `OpencodeAdapter` (wrap `server.rs`)
+- [ ] `git_diff` thay `GET /session/{id}/diff` (`worktree.rs` + test)
+- [ ] UI Chat đọc `transcripts` (mỗi slice `app.rs` <200 dòng)
 
-- Infinite canvas (separate project), code editing/LSP, model harness
-  internals (memory, evals, guardrails).
+## M4 — Workspace + Task (Host trước, chưa VM)
+
+- [ ] `workspace.rs` + `HostProvider` + `Task { id, slug, agent_ref }`
+- [ ] `agents.toml` + probe `which <bin>` (tick xanh/đỏ ở Agent picker)
+- [ ] Runtime: supervisors thay clients; kanban-lite dispatcher 60s + reclaim
+
+## M5 — MicroVM lõi (1 VM / workspace)
+
+- [ ] `vm.rs` + `Mock` + probe `/dev/kvm` → fallback Host (CI xanh không KVM)
+- [ ] `CloudHypervisorBackend`: boot → wait_ssh → mount virtiofs → stop
+- [ ] `ExternalSbxBackend` (`sbx run --mount`): đường tắt VM thật sớm
+- [ ] Tách crates `ade-workspace` / `ade-vm` khi API ổn định
+
+## M6 — Terminal modern (Warp-like + SSH attach)
+
+- [ ] Local pty tab + scrollback/search
+- [ ] SSH attach (key ephemeral) + port-forward preview `VM:3000 → host:41xx`
+- [ ] `TerminalAdapter` (`portable-pty`) + kit đầu `kits/opencode.sh`
+
+## M7 — Fleet reliability (học Hermes kanban)
+
+- [ ] Retry budget + circuit breaker (`failure_limit=2 → blocked`)
+- [ ] Structured handoff `summary/metadata + parent link`
+- [ ] Worktree hygiene: base `origin/HEAD`, 1 subtask = 1 worktree riêng
+
+## M8 — Review++ (học Orca aggregator + Codex review queue)
+
+- [ ] Review queue sort theo chờ-lâu-nhất; split-view 2 cột + cherry-pick hunk
+- [ ] `Hand off to local` vs `Create branch here`; annotate multi-line + thread
+- [ ] Editor-lite p1: read-only viewer (Tree-sitter), mở file từ diff
+
+## M9 — Cost / BYOK
+
+- [ ] `metrics.rs`: tokens/cost per task/model/agent; control-room view
+- [ ] Account switcher + rate-limit visibility; secrets qua env (không vào VM)
+
+## M10 — Remote / Notify (học Orca SSH + mobile)
+
+- [ ] SSH remote worktrees + host picker `~/.ssh/config`; cross-host dashboard
+- [ ] Telegram ping `done/needs-input` + `/followup` (trước app mobile)
+
+## M11 — Factory as-code (học Warp Factories)
+
+- [ ] `factory.yaml` (triggers/agents/gates) + settings sync
+- [ ] Automations cron/webhook; control-room runs
+
+## M12 — Evals / self-improve
+
+- [ ] Scorers mặc định + custom hook; Benchmarks so 2 configs
+- [ ] Memory per-repo (đề xuất update AGENTS.md). Không guardrails engine.
+
+## M13 — Task integrations
+
+- [ ] GitHub/Linear issues/PRs/boards in-app; `Open worktree from task`
+- [ ] Remote HTML preview
+
+## M14 — Hardening + Packaging
+
+- [ ] Defense-in-depth (native sandbox trong VM); audit secrets
+- [ ] AppImage/deb + size opt; KVM-less + offline fallback tests
+- [ ] P1 KHÔNG: Docker-in-VM, GPU passthrough, Balanced/Locked enforce
+
+## M15 — 1.0 polish
+
+- [ ] Perf 120fps audit; docs+labs full; dogfood `factory.yaml` cho repo này
+
+## Out of scope (giữ nguyên)
+
+- Infinite canvas (separate project), LSP/debug/marketplace đầy đủ,
+  model harness internals (memory routing, eval loops nặng).
